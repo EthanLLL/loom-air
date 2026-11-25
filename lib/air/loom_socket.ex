@@ -1,0 +1,230 @@
+defmodule Air.LoomSocket do
+  @moduledoc """
+  One Phoenix socket per tenant to its Loom's `/socket` (v2 JSON frames: `[join_ref, ref, topic, event,
+  payload]`), over Mint.WebSocket.
+
+  - `watch/5` joins `agent:<id>` from a seq taken before the submit, then waits for the `user` event with the
+    submit's `client_msg_id`; the `turn_done` after it sends `{:loom_reply, id, last_assistant_text}` to the
+    watcher.
+  - `read/3` joins from an earlier seq and returns the snapshot's events.
+
+  A topic stays joined while it has watchers. Events are deduplicated by seq per topic, so a re-join (Phoenix
+  replaces a duplicate join) or a reconnect never delivers twice. On a dropped connection it reconnects and
+  re-joins from the last seq it saw.
+  """
+  use GenServer
+  require Logger
+
+  @heartbeat 30_000
+
+  def start(tenant) do
+    case DynamicSupervisor.start_child(Air.Sup, {__MODULE__, tenant}) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+      e -> e
+    end
+  end
+
+  def child_spec(t), do: %{id: {__MODULE__, t["name"]}, start: {__MODULE__, :start_link, [t]}, restart: :transient}
+  def start_link(t), do: GenServer.start_link(__MODULE__, t, name: {:via, Registry, {Air.Registry, {:loom, t["name"]}}})
+
+  def watch(t, session, since_seq, client_msg_id, pid) do
+    {:ok, s} = start(t)
+    GenServer.call(s, {:watch, session, since_seq, client_msg_id, pid}, 20_000)
+  end
+
+  def read(t, session, since_seq) do
+    {:ok, s} = start(t)
+    GenServer.call(s, {:read, session, since_seq}, 20_000)
+  end
+
+  # ── server ──
+
+  @impl true
+  def init(t) do
+    send(self(), :connect)
+    {:ok, %{t: t, conn: nil, ws: nil, ref: nil, open: false, n: 0, topics: %{}, watches: %{}, waiting: %{}, later: []}}
+  end
+
+  @impl true
+  def handle_call(op, from, %{open: false} = s), do: {:noreply, %{s | later: s.later ++ [{op, from}]}}
+
+  def handle_call({:watch, id, since, cmid, pid}, from, s) do
+    topic = "agent:" <> id
+    w = %{cmid: cmid, pid: pid, phase: :wait, text: nil}
+    s = update_in(s.watches, &Map.update(&1, topic, [w], fn ws -> ws ++ [w] end))
+
+    if Map.has_key?(s.topics, topic) do
+      {:reply, :ok, s}
+    else
+      {:noreply, join(s, topic, since, {:watch, from})}
+    end
+  end
+
+  def handle_call({:read, id, since}, from, s), do: {:noreply, join(s, "agent:" <> id, since, {:read, from})}
+
+  @impl true
+  def handle_info(:connect, s) do
+    uri = URI.parse(s.t["loom_url"])
+    {http, ws} = if uri.scheme == "https", do: {:https, :wss}, else: {:http, :ws}
+    path = "/socket/websocket?" <> URI.encode_query(%{token: s.t["loom_token"], vsn: "2.0.0"})
+
+    with {:ok, conn} <- Mint.HTTP.connect(http, uri.host, uri.port, protocols: [:http1]),
+         {:ok, conn, ref} <- Mint.WebSocket.upgrade(ws, conn, path, []) do
+      {:noreply, %{s | conn: conn, ref: ref}}
+    else
+      e ->
+        Logger.warning("loom socket #{s.t["name"]}: connect failed #{inspect(e)}")
+        Process.send_after(self(), :connect, 5_000)
+        {:noreply, s}
+    end
+  end
+
+  def handle_info(:heartbeat, %{open: true} = s) do
+    Process.send_after(self(), :heartbeat, @heartbeat)
+    {:noreply, push(s, [nil, ref(s), "phoenix", "heartbeat", %{}]) |> bump()}
+  end
+
+  def handle_info(:heartbeat, s), do: {:noreply, s}
+
+  def handle_info(msg, %{conn: conn} = s) when conn != nil do
+    case Mint.WebSocket.stream(conn, msg) do
+      {:ok, conn, responses} -> {:noreply, Enum.reduce(responses, %{s | conn: conn}, &response/2)}
+      {:error, _conn, e, _} -> {:noreply, dropped(s, e)}
+      :unknown -> {:noreply, s}
+    end
+  end
+
+  def handle_info(_msg, s), do: {:noreply, s}
+
+  defp response({:status, _, status}, s), do: Map.put(s, :status, status)
+  defp response({:headers, _, headers}, s), do: Map.put(s, :headers, headers)
+
+  defp response({:done, _}, %{ws: nil} = s) do
+    case Mint.WebSocket.new(s.conn, s.ref, s.status, s.headers) do
+      {:ok, conn, ws} ->
+        Process.send_after(self(), :heartbeat, @heartbeat)
+        s = %{s | conn: conn, ws: ws, open: true}
+        # Re-join what was joined before the drop, then run what waited for the connection.
+        s = Enum.reduce(s.topics, %{s | topics: %{}}, fn {topic, %{last: last}}, s -> join(s, topic, last, nil) end)
+        Enum.reduce(s.later, %{s | later: []}, fn {op, from}, s -> {:noreply, s} = handle_call(op, from, s); s end)
+
+      {:error, _conn, e} ->
+        dropped(s, e)
+    end
+  end
+
+  defp response({:data, _, data}, %{ws: ws} = s) when ws != nil do
+    case Mint.WebSocket.decode(ws, data) do
+      {:ok, ws, frames} -> Enum.reduce(frames, %{s | ws: ws}, &frame/2)
+      {:error, _ws, e} -> dropped(s, e)
+    end
+  end
+
+  defp response(_, s), do: s
+
+  defp frame({:text, json}, s), do: message(Jason.decode!(json), s)
+  defp frame({:ping, d}, s), do: send_frame(s, {:pong, d})
+  defp frame({:close, _, _}, s), do: dropped(s, :closed)
+  defp frame(_, s), do: s
+
+  defp message([_jref, ref, topic, "phx_reply", %{"status" => st, "response" => resp}], s) do
+    case Map.pop(s.waiting, ref) do
+      {nil, _} ->
+        s
+
+      {{^topic, why}, waiting} ->
+        s = %{s | waiting: waiting}
+        events = if st == "ok", do: resp["events"] || [], else: []
+        s = Enum.reduce(events, s, &event(topic, &1, &2))
+
+        case why do
+          {:watch, from} -> GenServer.reply(from, if(st == "ok", do: :ok, else: {:error, resp}))
+          {:read, from} -> GenServer.reply(from, if(st == "ok", do: {:ok, resp}, else: {:error, resp}))
+          nil -> :ok
+        end
+
+        # A read of a topic nobody watches leaves it again.
+        if st == "ok" and not Map.has_key?(s.watches, topic), do: leave(s, topic), else: s
+    end
+  end
+
+  defp message([jref, _ref, topic, "event", ev], s) do
+    if get_in(s.topics, [topic, :jref]) == jref, do: event(topic, ev, s), else: s
+  end
+
+  defp message(_, s), do: s
+
+  defp event(topic, %{"seq" => seq} = ev, s) do
+    last = get_in(s.topics, [topic, :last]) || 0
+
+    if seq <= last do
+      s
+    else
+      s = if Map.has_key?(s.topics, topic), do: put_in(s.topics[topic].last, seq), else: s
+      ws = Enum.flat_map(Map.get(s.watches, topic, []), &advance(&1, topic, ev))
+
+      if ws == [] do
+        leave(%{s | watches: Map.delete(s.watches, topic)}, topic)
+      else
+        %{s | watches: Map.put(s.watches, topic, ws)}
+      end
+    end
+  end
+
+  defp event(_topic, _ev, s), do: s
+
+  defp advance(%{phase: :wait, cmid: cmid} = w, _topic, %{"kind" => "user", "payload" => %{"client_msg_id" => cmid}}),
+    do: [%{w | phase: :run}]
+
+  defp advance(%{phase: :run} = w, _topic, %{"kind" => "assistant_text", "payload" => %{"text" => t}}),
+    do: [%{w | text: t}]
+
+  defp advance(%{phase: :run} = w, "agent:" <> id, %{"kind" => "turn_done"}) do
+    send(w.pid, {:loom_reply, id, w.text || ""})
+    []
+  end
+
+  defp advance(%{phase: :run} = w, "agent:" <> id, %{"kind" => "error", "payload" => p}) do
+    send(w.pid, {:loom_error, id, p["message"] || inspect(p)})
+    []
+  end
+
+  defp advance(w, _, _), do: [w]
+
+  defp join(s, topic, since, why) do
+    r = ref(s)
+    s = push(s, [r, r, topic, "phx_join", %{since_seq: since, device: "loom-air"}]) |> bump()
+    last = max(since, get_in(s.topics, [topic, :last]) || 0)
+    s = put_in(s.topics[topic], %{jref: r, last: last})
+    %{s | waiting: Map.put(s.waiting, r, {topic, why})}
+  end
+
+  defp leave(s, topic) do
+    case Map.pop(s.topics, topic) do
+      {nil, _} -> s
+      {%{jref: j}, topics} -> push(%{s | topics: topics}, [j, ref(s), topic, "phx_leave", %{}]) |> bump()
+    end
+  end
+
+  defp ref(s), do: Integer.to_string(s.n + 1)
+  defp bump(s), do: %{s | n: s.n + 1}
+  defp push(s, msg), do: send_frame(s, {:text, Jason.encode!(msg)})
+
+  defp send_frame(%{ws: ws, conn: conn} = s, frame) when ws != nil do
+    with {:ok, ws, data} <- Mint.WebSocket.encode(ws, frame),
+         {:ok, conn} <- Mint.WebSocket.stream_request_body(conn, s.ref, data) do
+      %{s | ws: ws, conn: conn}
+    else
+      {:error, _, e} -> dropped(s, e)
+    end
+  end
+
+  defp dropped(s, why) do
+    Logger.warning("loom socket #{s.t["name"]}: dropped #{inspect(why)}")
+    if s.conn, do: Mint.HTTP.close(s.conn)
+    for {_, {_, {_, from}}} <- s.waiting, do: GenServer.reply(from, {:error, :disconnected})
+    Process.send_after(self(), :connect, 2_000)
+    %{s | conn: nil, ws: nil, ref: nil, open: false, waiting: %{}}
+  end
+end
