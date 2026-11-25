@@ -2,7 +2,8 @@
 # print every message, save each speech's PCM as a wav in /tmp/air-test/.
 import asyncio, base64, hashlib, hmac, json, os, secrets, sys, time, wave
 import websockets
-key = bytes.fromhex(open(os.path.expanduser("~/.config/app-auth/secret")).read().strip())
+import env  # noqa: F401  (.env → os.environ)
+key = bytes.fromhex(open(os.environ["AIR_APP_SECRET"]).read().strip())
 body = f"{int(time.time()) + 1200}.{secrets.token_urlsafe(9)}"
 mac = base64.urlsafe_b64encode(hmac.new(key, body.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
 URL = os.environ.get("AIR_WS", "ws://localhost:5000/apps/loom-air/ws")

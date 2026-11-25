@@ -1,6 +1,7 @@
 # Records the operator's clips through infer-gw in one voice: data/clips/<voice>/<name>.wav + clips.json.
 # Usage: make-clips.py <voice> [name ...]   (no names = all; existing ones are redone only when named)
 import json, os, subprocess, sys, time, requests
+import env  # noqa: F401  (.env → os.environ)
 VOICE = sys.argv[1]  # a voice registered on the workers; voices are private configuration, never a default here
 ONLY = set(sys.argv[2:])
 CLIPS = [
@@ -20,16 +21,16 @@ CLIPS = [
     ("bye_1", "好喔，那先这样，拜拜啦。"),
     ("bye_2", "嗯，拜拜，有事再叫我喔。"),
 ]
-D = os.path.expanduser(f"~/work/loom-air/data/clips/{VOICE}")
+D = os.path.join(os.environ["AIR_DATA"], "clips", VOICE)
 os.makedirs(D, exist_ok=True)
-KEY = open(os.path.expanduser("~/work/infer-gw/infra/keys/loom-air")).read().strip()
+KEY = open(os.environ["AIR_GW_KEY_FILE"]).read().strip()
 for name, text in CLIPS:
     out = f"{D}/{name}.wav"
     if os.path.exists(out) and name not in ONLY: continue
     if ONLY and name not in ONLY: continue
     t = time.time()
-    r = requests.post("http://172.31.59.210:8090/v1/audio/speech", timeout=400, headers={"Authorization": f"Bearer {KEY}"},
-                      json={"model": "step-audio-editx", "input": text, "voice": VOICE, "response_format": "wav",
+    r = requests.post(os.environ["AIR_GW_URL"] + "/v1/audio/speech", timeout=400, headers={"Authorization": f"Bearer {KEY}"},
+                      json={"model": os.environ.get("AIR_GW_MODEL", "step-audio-editx"), "input": text, "voice": VOICE, "response_format": "wav",
                             "extra_params": {"temperature": 0.85}})
     r.raise_for_status()
     open(out, "wb").write(r.content)
