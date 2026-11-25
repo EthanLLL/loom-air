@@ -57,13 +57,30 @@ persona-styled version of it and points the user to the session for details.
 **Tenant config** (`data/tenants.json`, 0600): Loom URL + token, voice, temperature, persona text, ASR keywords.
 The persona and keywords go into the system prompt; voices and clips are private data, never in the repo.
 
+## Call records and memory (user, 2026-11-25)
+
+- **Record:** every call is appended as it happens to `data/calls/<tenant>/<UTC start>.jsonl`: call_start
+  (voice, temperature, model), tts changes, each turn's input, heard, say (spoken or not), clips, tools with
+  results, Loom replies, errors, call_end. Raw and complete; nothing reads it during a call.
+- **Memory:** `data/memory/<tenant>/memory.md`. A call reads it once when it starts and keeps that snapshot to
+  the end, at the end of its system prompt (before the cache point, so it stays cached). There is no tool
+  for old calls: memory is all the operator knows about them.
+- **Rewrite:** when a call ends, `Air.Memory` (one GenServer per tenant, rewrites one at a time, each from
+  the latest memory) gives Opus 5.5 the current memory plus the call rendered as a dialogue (with the session
+  list it started with) and stores the whole new memory. A call that starts meanwhile simply uses the
+  snapshot as it is. The previous version goes to `history/<UTC>.md`. Calls where the user said nothing are
+  skipped.
+- **What memory holds:** name and how to address them, people they mention, preferences about the operator,
+  frequent topics, which sessions do what. Not: dialogue, task results, session status or pending work (live
+  state from Loom; a reply that comes back after hang-up is simply in its session). ~1500 characters, English.
+
 ## Processes
 
 ```
 Air.Application
 ├─ Finch Air.Finch
 ├─ Registry Air.Registry           LoomSocket per tenant
-├─ DynamicSupervisor Air.Sup       Air.Call, Air.LoomSocket
+├─ DynamicSupervisor Air.Sup       Air.Call, Air.LoomSocket, Air.Memory (per tenant)
 ├─ Task.Supervisor Air.Tasks       model turns, TTS streams, gw polls
 └─ Bandit (Air.Web.Router)         page, clips, /ws (WebSock → Air.Web.Socket)
 ```

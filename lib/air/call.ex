@@ -25,7 +25,7 @@ defmodule Air.Call do
     s = %{
       t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
       speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0, told: %{}, log: log_path(t),
-      ctx: %{t: t, clips: clips, call: self(), system: Operator.system(t, clips), tools: Operator.tools(clips)}
+      ctx: %{t: t, clips: clips, call: self(), system: Operator.system(t, clips, Air.Memory.read(t["name"])), tools: Operator.tools(clips)}
     }
 
     record(s, %{type: "call_start", tenant: t["name"], voice: t["voice"], temperature: t["temperature"],
@@ -328,6 +328,7 @@ defmodule Air.Call do
   @impl true
   def terminate(reason, s) do
     record(s, %{type: "call_end", reason: inspect(reason)})
+    Air.Memory.call_ended(s.t, s.log)
   end
 
   defp state(s) do

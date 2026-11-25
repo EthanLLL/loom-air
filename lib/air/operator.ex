@@ -7,7 +7,7 @@ defmodule Air.Operator do
   @max_rounds 6
   @final ~w(play_clip end_call send_to_session new_session)
 
-  def system(t, clips) do
+  def system(t, clips, memory) do
     keywords = Enum.join(t["keywords"] || [], "、")
 
     """
@@ -52,6 +52,11 @@ defmodule Air.Operator do
 
     Clips (name: words):
     #{Enum.map_join(clips, "\n", &"- #{&1["name"]}: #{&1["text"]}")}
+
+    What you remember about them from earlier calls (use it naturally, never recite it):
+    <memory>
+    #{if memory == "", do: "(nothing yet: this is the first call)", else: memory}
+    </memory>
     """
   end
 

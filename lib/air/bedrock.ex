@@ -4,11 +4,12 @@ defmodule Air.Bedrock do
   require Logger
 
   # One retry on a transport error: a call costs ~1 s, a dead connection should not cost the turn.
-  def converse(body, purpose) do
-    case call(body, purpose) do
+  # `opts`: `model` (default the operator's), `timeout` in ms (default 20 s).
+  def converse(body, purpose, opts \\ []) do
+    case call(body, purpose, opts) do
       {:error, {:transport, e}} ->
         Logger.warning("bedrock transport error, retrying: #{e}")
-        call(body, purpose) |> unwrap()
+        call(body, purpose, opts) |> unwrap()
 
       r ->
         unwrap(r)
@@ -18,15 +19,15 @@ defmodule Air.Bedrock do
   defp unwrap({:error, {:transport, e}}), do: {:error, "bedrock: #{e}"}
   defp unwrap(r), do: r
 
-  defp call(body, purpose) do
+  defp call(body, purpose, opts) do
     region = Air.Config.get(:region)
-    model = Air.Config.get(:model)
+    model = Keyword.get(opts, :model, Air.Config.get(:model))
     url = "https://bedrock-runtime.#{region}.amazonaws.com/model/#{URI.encode(model, &URI.char_unreserved?/1)}/converse"
     json = Jason.encode!(body)
     headers = Air.AWS.sign("bedrock", region, "post", url, [{"content-type", "application/json"}], json)
     t0 = System.monotonic_time(:millisecond)
 
-    case Finch.build(:post, url, headers, json) |> Finch.request(Air.Finch, receive_timeout: 20_000) do
+    case Finch.build(:post, url, headers, json) |> Finch.request(Air.Finch, receive_timeout: Keyword.get(opts, :timeout, 20_000)) do
       {:ok, %{status: 200, body: b}} ->
         r = Jason.decode!(b)
         Air.Config.log_usage(%{model: model, for: purpose, ms: System.monotonic_time(:millisecond) - t0, usage: r["usage"]})
