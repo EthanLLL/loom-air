@@ -3,14 +3,15 @@ defmodule Air.LoomSocket do
   One Phoenix socket per tenant to its Loom's `/socket` (v2 JSON frames: `[join_ref, ref, topic, event,
   payload]`), over Mint.WebSocket.
 
-  - `watch/5` joins `agent:<id>` from a seq taken before the submit, then waits for the `user` event with the
-    submit's `client_msg_id`; the `turn_done` after it sends `{:loom_reply, id, last_assistant_text}` to the
-    watcher.
+  - `subscribe/4` follows a session for a call: it joins `agent:<id>` (from a seq taken before a submit, so the
+    reply cannot slip past), and every `turn_done` after that sends `{:loom_reply, id, last_assistant_text}`
+    to the subscriber, once per turn, whoever started it. Subscribing again is a no-op, so a call follows a
+    session at most once. Subscribers are monitored: a call that ends drops its subscriptions.
   - `read/3` joins from an earlier seq and returns the snapshot's events.
   - `sessions/1` is the session list, kept current from the lobby channel (`agents`: the whole list in the
     join reply, then `session` / `removed` pushes), so nobody has to ask Loom for it.
 
-  A topic stays joined while it has watchers. Events are deduplicated by seq per topic, so a re-join (Phoenix
+  A topic stays joined while it has subscribers. Events are deduplicated by seq per topic, so a re-join (Phoenix
   replaces a duplicate join) or a reconnect never delivers twice. On a dropped connection it reconnects and
   re-joins from the last seq it saw.
   """
@@ -30,9 +31,9 @@ defmodule Air.LoomSocket do
   def child_spec(t), do: %{id: {__MODULE__, t["name"]}, start: {__MODULE__, :start_link, [t]}, restart: :transient}
   def start_link(t), do: GenServer.start_link(__MODULE__, t, name: {:via, Registry, {Air.Registry, {:loom, t["name"]}}})
 
-  def watch(t, session, since_seq, client_msg_id, pid) do
+  def subscribe(t, session, since_seq, pid) do
     {:ok, s} = start(t)
-    GenServer.call(s, {:watch, session, since_seq, client_msg_id, pid}, 20_000)
+    GenServer.call(s, {:subscribe, session, since_seq, pid}, 20_000)
   end
 
   def sessions(t) do
@@ -50,7 +51,7 @@ defmodule Air.LoomSocket do
   @impl true
   def init(t) do
     send(self(), :connect)
-    {:ok, %{t: t, conn: nil, ws: nil, ref: nil, open: false, n: 0, topics: %{}, watches: %{}, waiting: %{}, later: [],
+    {:ok, %{t: t, conn: nil, ws: nil, ref: nil, open: false, n: 0, topics: %{}, subs: %{}, waiting: %{}, later: [],
       lobby: nil, sessions: %{}}}
   end
 
@@ -61,15 +62,20 @@ defmodule Air.LoomSocket do
   def handle_call(:sessions, from, %{lobby: {:joining, _}} = s), do: {:noreply, %{s | later: s.later ++ [{:sessions, from}]}}
   def handle_call(:sessions, _from, s), do: {:reply, {:ok, Map.values(s.sessions)}, s}
 
-  def handle_call({:watch, id, since, cmid, pid}, from, s) do
+  # subs: topic => %{pids: MapSet, text: the last assistant_text of the turn running}
+  def handle_call({:subscribe, id, since, pid}, from, s) do
     topic = "agent:" <> id
-    w = %{cmid: cmid, pid: pid, phase: :wait, text: nil}
-    s = update_in(s.watches, &Map.update(&1, topic, [w], fn ws -> ws ++ [w] end))
+    sub = Map.get(s.subs, topic, %{pids: MapSet.new(), text: nil})
 
-    if Map.has_key?(s.topics, topic) do
+    if MapSet.member?(sub.pids, pid) do
       {:reply, :ok, s}
     else
-      {:noreply, join(s, topic, since, {:watch, from})}
+      if not Enum.any?(s.subs, fn {_, x} -> MapSet.member?(x.pids, pid) end), do: Process.monitor(pid)
+      s = put_in(s.subs[topic], %{sub | pids: MapSet.put(sub.pids, pid)})
+
+      if Map.has_key?(s.topics, topic),
+        do: {:reply, :ok, s},
+        else: {:noreply, join(s, topic, since, {:subscribe, from})}
     end
   end
 
@@ -98,6 +104,20 @@ defmodule Air.LoomSocket do
   end
 
   def handle_info(:heartbeat, s), do: {:noreply, s}
+
+  # A call ended: drop its subscriptions, and leave the topics nobody follows any more.
+  def handle_info({:DOWN, _, :process, pid, _}, s) do
+    s =
+      Enum.reduce(s.subs, s, fn {topic, sub}, s ->
+        pids = MapSet.delete(sub.pids, pid)
+
+        if MapSet.size(pids) == 0,
+          do: leave(%{s | subs: Map.delete(s.subs, topic)}, topic),
+          else: put_in(s.subs[topic].pids, pids)
+      end)
+
+    {:noreply, s}
+  end
 
   def handle_info(msg, %{conn: conn} = s) when conn != nil do
     case Mint.WebSocket.stream(conn, msg) do
@@ -170,13 +190,13 @@ defmodule Air.LoomSocket do
         s = Enum.reduce(events, s, &event(topic, &1, &2))
 
         case why do
-          {:watch, from} -> GenServer.reply(from, if(st == "ok", do: :ok, else: {:error, resp}))
+          {:subscribe, from} -> GenServer.reply(from, if(st == "ok", do: :ok, else: {:error, resp}))
           {:read, from} -> GenServer.reply(from, if(st == "ok", do: {:ok, resp}, else: {:error, resp}))
           nil -> :ok
         end
 
-        # A read of a topic nobody watches leaves it again.
-        if st == "ok" and not Map.has_key?(s.watches, topic), do: leave(s, topic), else: s
+        # A read of a topic nobody follows leaves it again.
+        if st == "ok" and not Map.has_key?(s.subs, topic), do: leave(s, topic), else: s
     end
   end
 
@@ -193,35 +213,29 @@ defmodule Air.LoomSocket do
       s
     else
       s = if Map.has_key?(s.topics, topic), do: put_in(s.topics[topic].last, seq), else: s
-      ws = Enum.flat_map(Map.get(s.watches, topic, []), &advance(&1, topic, ev))
 
-      if ws == [] do
-        leave(%{s | watches: Map.delete(s.watches, topic)}, topic)
-      else
-        %{s | watches: Map.put(s.watches, topic, ws)}
+      case s.subs[topic] do
+        nil -> s
+        sub -> put_in(s.subs[topic], advance(sub, topic, ev))
       end
     end
   end
 
   defp event(_topic, _ev, s), do: s
 
-  defp advance(%{phase: :wait, cmid: cmid} = w, _topic, %{"kind" => "user", "payload" => %{"client_msg_id" => cmid}}),
-    do: [%{w | phase: :run}]
+  defp advance(sub, _topic, %{"kind" => "assistant_text", "payload" => %{"text" => t}}), do: %{sub | text: t}
 
-  defp advance(%{phase: :run} = w, _topic, %{"kind" => "assistant_text", "payload" => %{"text" => t}}),
-    do: [%{w | text: t}]
-
-  defp advance(%{phase: :run} = w, "agent:" <> id, %{"kind" => "turn_done"}) do
-    send(w.pid, {:loom_reply, id, w.text || ""})
-    []
+  defp advance(sub, "agent:" <> id, %{"kind" => "turn_done"}) do
+    for pid <- sub.pids, do: send(pid, {:loom_reply, id, sub.text || ""})
+    %{sub | text: nil}
   end
 
-  defp advance(%{phase: :run} = w, "agent:" <> id, %{"kind" => "error", "payload" => p}) do
-    send(w.pid, {:loom_error, id, p["message"] || inspect(p)})
-    []
+  defp advance(sub, "agent:" <> id, %{"kind" => "error", "payload" => p}) do
+    for pid <- sub.pids, do: send(pid, {:loom_error, id, p["message"] || inspect(p)})
+    %{sub | text: nil}
   end
 
-  defp advance(w, _, _), do: [w]
+  defp advance(sub, _, _), do: sub
 
   defp join(s, topic, since, why) do
     r = ref(s)

@@ -7,7 +7,12 @@ defmodule Air.Operator do
   @max_rounds 6
   @final ~w(play_clip end_call send_to_session new_session)
 
-  def system(t, clips, memory) do
+  @doc """
+  The system prompt for a phase: `:cold` while TTS is starting (only clips can be heard), `:warm` once it is
+  ready. A call switches once, cold to warm, at the start of a turn; the tool list changes with it, so the
+  cache is lost for that one round either way, and each phase gets the prompt that fits it.
+  """
+  def system(t, memory, phase) do
     keywords = Enum.join(t["keywords"] || [], "、")
 
     """
@@ -18,14 +23,10 @@ defmodule Air.Operator do
     The phone transcribes what they say; it arrives as <heard>. Expect ASR mistakes and fix them silently from \
     context. Words it often gets wrong: #{keywords}.
 
-    Everything you write as text is spoken aloud at once by TTS, in this persona:
+    Your voice, in this persona:
     #{t["persona"]}
 
-    How to speak:
-    - Simplified Chinese, spoken, one or two short sentences. No markdown, lists, emoji, code, URLs, session \
-    ids or file paths. Say numbers the way people say them.
-    - Never read out a long answer. A Loom reply is the written answer and stays in its session; give the gist \
-    in a sentence or two and say the details are in the session.
+    #{String.trim(speaking(phase))}
 
     What to do:
     - When they ask for Loom or a session by name, do exactly that, even if you could answer yourself.
@@ -33,25 +34,15 @@ defmodule Air.Operator do
     - Anything that needs real work (their files, machines, code, data, the web, anything you would have to \
     guess): hand it to Loom. Use send_to_session when it clearly continues an existing session, otherwise \
     new_session. Write the prompt for an agent: full sentences in Chinese, self-contained, with what they asked \
-    and any detail they gave. In the same reply, before the tool call, tell them briefly that you're handing it \
-    over: nothing is said after it. The reply comes later as <loom_reply>; then tell them the gist.
+    and any detail they gave. #{handoff(phase)} The reply comes later as <loom_reply>; then tell them the gist.
     - Their sessions are listed in <sessions> when the call starts; <sessions_changed> brings what changed since. \
     Answer questions about which sessions exist or run from that, without a tool.
-    - Asked about progress: read_session, never invent what a session did. Never submit the same thing twice, \
-    never send chit-chat to Loom.
+    - Asked about progress: read_sessions (all the sessions asked about in one call), never invent what a \
+    session did. Never submit the same thing twice, never send chit-chat to Loom.
+    - The sessions you read, send to or start are followed for the rest of the call: each time one finishes \
+    a turn, its reply arrives as <loom_reply>, also for turns you did not start.
 
-    <state tts=…> tells you whether your text can be spoken. When tts is not "ready", text is NOT spoken: \
-    answer with play_clip only (pick the one that fits, vary them) and write no text. When it is ready, speak \
-    with text and use a clip only when one fits exactly.
-
-    Text after a tool result is spoken too, so never narrate what you did ("submitted", "checked"): after a \
-    tool, write only what you would say to them, or nothing.
-
-    <call_started/>: they just dialled; greet them with a greeting clip.
-    When they say goodbye: say goodbye (a clip or text), then end_call.
-
-    Clips (name: words):
-    #{Enum.map_join(clips, "\n", &"- #{&1["name"]}: #{&1["text"]}")}
+    #{ends(phase)}
 
     What you remember about them from earlier calls (use it naturally, never recite it):
     <memory>
@@ -60,14 +51,39 @@ defmodule Air.Operator do
     """
   end
 
-  def tools(clips) do
-    names = Enum.map(clips, & &1["name"])
+  defp speaking(:cold) do
+    """
+    Your speech synthesis is still starting up (about a minute), so nothing you write as text is heard. Speak \
+    only with play_clip: pick the kind that fits. Everything else works as usual.
+    """
+  end
 
+  defp speaking(:warm) do
+    """
+    Everything you write as text is spoken aloud at once by TTS. How to speak:
+    - Simplified Chinese, spoken, one or two short sentences. No markdown, lists, emoji, code, URLs, session ids \
+    or file paths. Say numbers the way people say them.
+    - Never read out a long answer. A Loom reply is the written answer and stays in its session; give the gist \
+    in a sentence or two and say the details are in the session.
+    - Text after a tool result is spoken too, so never narrate what you did ("submitted", "checked"): after a \
+    tool, write only what you would say to them, or nothing.
+    """
+  end
+
+  defp handoff(:cold), do: "In the same reply, play a handoff clip."
+  defp handoff(:warm), do: "In the same reply, before the tool call, tell them briefly that you're handing it over: nothing is said after it."
+
+  defp ends(:cold), do: "<call_started/>: they just dialled; greet them with a greet clip.\nWhen they say goodbye: a bye clip, then end_call."
+  defp ends(:warm), do: "<call_started/>: they just dialled; greet them.\nWhen they say goodbye: say goodbye, then end_call."
+
+  @doc "The tools for a phase: play_clip only while cold."
+  def tools(clips, :cold), do: [play_clip(clips) | tools()]
+  def tools(_clips, :warm), do: tools()
+
+  defp tools do
     [
-      tool("play_clip", "Play a pre-recorded clip in the persona's voice. Instant, works while TTS is cold.",
-        %{name: %{type: "string", enum: names}}, ["name"]),
-      tool("read_session", "A session's status and its last few user and assistant messages.",
-        %{session_id: %{type: "string"}}, ["session_id"]),
+      tool("read_sessions", "Sessions' status and latest messages: the last few for one session, the last reply in short for several. Reading a session also follows it for the rest of the call.",
+        %{session_ids: %{type: "array", items: %{type: "string"}}}, ["session_ids"]),
       tool("send_to_session", "Send a message to an existing session. Returns at once; the reply comes later as <loom_reply>.",
         %{session_id: %{type: "string"}, text: %{type: "string"}}, ["session_id", "text"]),
       tool("new_session", "Start a new Loom session (Claude Code) with this prompt. Returns at once; the reply comes later as <loom_reply>.",
@@ -75,6 +91,18 @@ defmodule Air.Operator do
       tool("end_call", "Hang up. Only after saying goodbye.", %{}, [])
     ]
   end
+
+  # One kind per name prefix (greet_1, greet_2 → greet); the tool picks one of the kind at random and says
+  # which words were played. Adding a clip is adding a file: the kinds and examples come from the clips.
+  defp play_clip(clips) do
+    kinds = clips |> Enum.group_by(&kind/1) |> Enum.sort_by(fn {k, _} -> Enum.find_index(clips, &(kind(&1) == k)) end)
+    examples = Enum.map_join(kinds, "; ", fn {k, [c | _]} -> "#{k} (e.g. 「#{c["text"]}」)" end)
+
+    tool("play_clip", "Play a pre-recorded clip of your voice, picked at random from the kind. Kinds: #{examples}.",
+      %{kind: %{type: "string", enum: Enum.map(kinds, &elem(&1, 0))}}, ["kind"])
+  end
+
+  def kind(%{"name" => name}), do: String.replace(name, ~r/_\d+$/, "")
 
   defp tool(name, desc, props, required) do
     %{toolSpec: %{name: name, description: desc,
@@ -89,18 +117,23 @@ defmodule Air.Operator do
       system: [%{text: ctx.system}, %{cachePoint: %{type: "default"}}],
       messages: messages,
       toolConfig: %{tools: ctx.tools ++ [%{cachePoint: %{type: "default"}}]},
-      inferenceConfig: %{maxTokens: 600}
+      inferenceConfig: %{maxTokens: 2000}
     }
 
-    # Haiku 5.5 thinks adaptively; on a phone line the second it costs matters more (AIR_THINKING=adaptive).
-    body =
-      if Air.Config.get(:thinking) == "disabled",
-        do: Map.put(body, :additionalModelRequestFields, %{thinking: %{type: "disabled"}}),
-        else: body
+    # Adaptive thinking at the lowest effort: easy turns don't think at all, and thinking is never spoken.
+    # Not "between_tools" (Sonnet 5.5's thinking-off): with it the model wrote notes to itself before
+    # tool calls as plain text ("用户想看…，我先读一下"), and those were spoken.
+    fields =
+      %{thinking: %{type: Air.Config.get(:thinking)}}
+      |> then(&if(e = Air.Config.get(:effort), do: Map.put(&1, :output_config, %{effort: e}), else: &1))
+
+    body = Map.put(body, :additionalModelRequestFields, fields)
 
     case Air.Bedrock.converse(body, "operator") do
       {:ok, %{"output" => %{"message" => %{"content" => content}}, "stopReason" => stop}} ->
-        content = Enum.map(content, &clean/1)
+        # Thinking blocks never go into the history: each is bound to the exact prompt and tools it was made
+        # under, and both change when the call warms up. They are never spoken either.
+        content = content |> Enum.map(&clean/1) |> Enum.reject(&is_nil/1)
         messages = messages ++ [%{role: "assistant", content: content}]
 
         results =
@@ -109,7 +142,6 @@ defmodule Air.Operator do
               if String.trim(text) != "", do: send(ctx.call, {:say, String.trim(text)})
               []
             %{toolUse: use} -> [run(ctx, use)]
-            # reasoningContent and the like stay in the history as they came, and are not spoken.
             _ -> []
           end)
 
@@ -141,6 +173,7 @@ defmodule Air.Operator do
 
   defp clean(%{"text" => t}), do: %{text: t}
   defp clean(%{"toolUse" => u}), do: %{toolUse: %{toolUseId: u["toolUseId"], name: u["name"], input: u["input"] || %{}}}
+  defp clean(%{"reasoningContent" => _}), do: nil
   defp clean(other), do: other
 
   defp run(ctx, %{toolUseId: id, name: name, input: input}) do
@@ -163,12 +196,15 @@ defmodule Air.Operator do
   defp summary({:ok, d}), do: Jason.encode!(d) |> String.slice(0, 400)
   defp summary({:error, e}), do: "error: " <> to_string(e)
 
-  defp tool_call(ctx, "play_clip", %{"name" => name}) do
-    if Enum.any?(ctx.clips, &(&1["name"] == name)) do
-      send(ctx.call, {:clip, name})
-      {:ok, "played"}
-    else
-      {:error, "no clip #{name}"}
+  defp tool_call(ctx, "play_clip", %{"kind" => kind}) do
+    case Enum.filter(ctx.clips, &(kind(&1) == kind)) do
+      [] ->
+        {:error, "no clip of kind #{kind}"}
+
+      some ->
+        clip = Enum.random(some)
+        send(ctx.call, {:clip, clip["name"]})
+        {:ok, "played 「#{clip["text"]}」"}
     end
   end
 
@@ -177,31 +213,69 @@ defmodule Air.Operator do
     {:ok, "hanging up"}
   end
 
-  defp tool_call(ctx, "read_session", %{"session_id" => id}) do
-    with {:ok, s} <- session(ctx, id),
-         {:ok, snap} <- Air.LoomSocket.read(ctx.t, id, max((s["seq"] || 0) - 80, 0)) do
-      msgs =
-        for %{"kind" => k, "payload" => p} <- snap["events"], k in ["user", "assistant_text"], (p["text"] || "") != "" do
-          %{from: if(k == "user", do: "user", else: "agent"), text: String.slice(p["text"], 0, 1200)}
-        end
+  defp tool_call(ctx, "read_sessions", %{"session_ids" => [_ | _] = ids}) do
+    {:ok, list} = Air.LoomSocket.sessions(ctx.t)
+    detail = length(ids) == 1
 
-      {:ok, %{title: s["title"], status: s["status"], messages: Enum.take(msgs, -6)}}
-    end
+    views =
+      ids
+      |> Task.async_stream(&read(ctx, list, &1, detail), timeout: 25_000, on_timeout: :kill_task)
+      |> Enum.zip_with(ids, fn
+        {:ok, view}, _ -> view
+        _, id -> %{session_id: id, error: "timed out"}
+      end)
+
+    {:ok, if(detail, do: hd(views), else: views)}
   end
 
   defp tool_call(ctx, "send_to_session", %{"session_id" => id, "text" => text}) do
     with {:ok, s} <- session(ctx, id) do
-      submit(ctx, id, s["title"], s["seq"] || 0, text)
+      submit(ctx, id, s["seq"] || 0, text)
     end
   end
 
   defp tool_call(ctx, "new_session", %{"title" => title, "prompt" => prompt}) do
     with {:ok, s} <- Air.Loom.create(ctx.t, title) do
-      submit(ctx, s["id"], title, s["seq"] || 0, prompt)
+      submit(ctx, s["id"], s["seq"] || 0, prompt)
     end
   end
 
   defp tool_call(_ctx, name, _), do: {:error, "unknown tool #{name}"}
+
+  # One session, read and followed. Followed first, from its current seq, so the read's older events are not
+  # taken for new ones. One session gets its last few messages; several get the last reply each, in short.
+  defp read(ctx, list, id, detail) do
+    with s when s != nil <- Enum.find(list, &(&1["id"] == id)) || {:error, "no session #{id}"},
+         :ok <- follow(ctx, id, s["seq"] || 0),
+         {:ok, snap} <- Air.LoomSocket.read(ctx.t, id, max((s["seq"] || 0) - 80, 0)) do
+      Map.merge(%{session_id: id, title: s["title"], status: s["status"]}, view(snap["events"], detail))
+    else
+      {:error, e} -> %{session_id: id, error: to_string(e)}
+      e -> %{session_id: id, error: inspect(e)}
+    end
+  end
+
+  defp follow(ctx, id, seq) do
+    with :ok <- Air.LoomSocket.subscribe(ctx.t, id, seq, ctx.call) do
+      send(ctx.call, {:following, id})
+      :ok
+    end
+  end
+
+  @doc "What read_sessions shows of a session's events."
+  def view(events, true) do
+    msgs =
+      for %{"kind" => k, "payload" => p} <- events, k in ["user", "assistant_text"], (p["text"] || "") != "" do
+        %{from: if(k == "user", do: "user", else: "agent"), text: String.slice(p["text"], 0, 1200)}
+      end
+
+    %{messages: Enum.take(msgs, -6)}
+  end
+
+  def view(events, false) do
+    last = for(%{"kind" => "assistant_text", "payload" => %{"text" => t}} <- events, t != "", do: t) |> List.last()
+    %{last_reply: if(last, do: String.slice(last, 0, 300), else: nil)}
+  end
 
   defp session(ctx, id) do
     with {:ok, list} <- Air.LoomSocket.sessions(ctx.t) do
@@ -212,13 +286,12 @@ defmodule Air.Operator do
     end
   end
 
-  # Watch first, from the seq before the submit, so the reply cannot slip past.
-  defp submit(ctx, id, title, seq, text) do
+  # Follow first, from the seq before the submit, so the reply cannot slip past.
+  defp submit(ctx, id, seq, text) do
     cmid = "air_" <> Base.url_encode64(:crypto.strong_rand_bytes(6), padding: false)
 
-    with :ok <- Air.LoomSocket.watch(ctx.t, id, seq, cmid, ctx.call),
+    with :ok <- follow(ctx, id, seq),
          {:ok, %{"status" => disposition}} <- Air.Loom.submit(ctx.t, id, text, cmid) do
-      send(ctx.call, {:task, id, title})
       {:ok, %{session_id: id, status: disposition}}
     end
   end

@@ -24,8 +24,8 @@ defmodule Air.Call do
 
     s = %{
       t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
-      speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0, told: %{}, log: log_path(t),
-      ctx: %{t: t, clips: clips, call: self(), system: Operator.system(t, clips, Air.Memory.read(t["name"])), tools: Operator.tools(clips)}
+      speaking: nil, tts: %{state: :off, up_s: 0}, following: MapSet.new(), polls: nil, ending: false, n: 0, told: %{}, log: log_path(t),
+      ctx: %{t: t, clips: clips, call: self()}, phases: phases(t, clips)
     }
 
     record(s, %{type: "call_start", tenant: t["name"], voice: t["voice"], temperature: t["temperature"],
@@ -80,8 +80,8 @@ defmodule Air.Call do
 
   def handle_info(:end_call, s), do: {:noreply, speak(%{s | ending: true}, :end)}
 
-  def handle_info({:task, id, title}, s) do
-    s = put_in(s.tasks[id], title)
+  def handle_info({:following, id}, s) do
+    s = %{s | following: MapSet.put(s.following, id)}
     state(s)
     {:noreply, s}
   end
@@ -91,9 +91,8 @@ defmodule Air.Call do
   # ── from Loom ──
 
   def handle_info({:loom_reply, id, text}, s) do
-    title = Map.get(s.tasks, id, "")
+    title = with({:ok, list} <- Air.LoomSocket.sessions(s.t), %{"title" => t} <- Enum.find(list, &(&1["id"] == id)), do: t, else: (_ -> ""))
     out(s, %{type: "loom_reply", session: id, title: title, text: text})
-    s = %{s | tasks: Map.delete(s.tasks, id)}
     state(s)
     reply = String.slice(text, 0, 4000)
     {:noreply, s |> event(~s(<loom_reply session="#{id}" title="#{title}">#{reply}</loom_reply>)) |> flush()}
@@ -101,7 +100,6 @@ defmodule Air.Call do
 
   def handle_info({:loom_error, id, msg}, s) do
     out(s, %{type: "error", text: "Loom #{id}: #{msg}"})
-    s = %{s | tasks: Map.delete(s.tasks, id)}
     {:noreply, s |> event(~s(<loom_error session="#{id}">#{msg}</loom_error>)) |> flush()}
   end
 
@@ -178,14 +176,22 @@ defmodule Air.Call do
   defp flush(%{turn: nil, pending: [_ | _], ending: false} = s) do
     {changed, s} = sessions_changed(s)
     text = Enum.join([state_tag(s) | changed] ++ s.pending, "\n")
-    record(s, %{type: "turn_in", text: text})
+    phase = if s.tts.state == :ready, do: :warm, else: :cold
+    record(s, %{type: "turn_in", phase: phase, text: text})
     messages = append_user(s.messages, %{text: text})
-    ctx = s.ctx
+    ctx = Map.merge(s.ctx, s.phases[phase])
     task = Task.Supervisor.async_nolink(Air.Tasks, fn -> Operator.turn(ctx, messages) end)
     %{s | turn: task.ref, pending: []}
   end
 
   defp flush(s), do: s
+
+  # The prompt and tools per phase, from the memory as it is when the call starts. A turn takes the phase TTS
+  # is in when it starts: cold until it is ready, then warm for the rest of the call.
+  defp phases(t, clips) do
+    memory = Air.Memory.read(t["name"])
+    Map.new([:cold, :warm], &{&1, %{system: Operator.system(t, memory, &1), tools: Operator.tools(clips, &1)}})
+  end
 
   # Converse wants roles to alternate; a turn that ran out of tool rounds ends on a user message.
   defp append_user(messages, block) do
@@ -260,7 +266,7 @@ defmodule Air.Call do
         %{state: st} -> to_string(st)
       end
 
-    tasks = s.tasks |> Map.values() |> Enum.map_join("; ", & &1)
+    tasks = Enum.join(running(s), "; ")
     ~s(<state tts="#{tts}" loom_tasks_running="#{tasks}"/>)
   end
 
@@ -331,7 +337,15 @@ defmodule Air.Call do
     Air.Memory.call_ended(s.t, s.log)
   end
 
+  # The followed sessions that are running now, by title, from the lobby's list.
+  defp running(s) do
+    case Air.LoomSocket.sessions(s.t) do
+      {:ok, list} -> for x <- list, x["id"] in s.following, status(x) == "running", do: x["title"]
+      _ -> []
+    end
+  end
+
   defp state(s) do
-    out(s, %{type: "state", tts: s.tts.state, up_s: s.tts.up_s, tasks: s.tasks |> Map.values()})
+    out(s, %{type: "state", tts: s.tts.state, up_s: s.tts.up_s, tasks: running(s)})
   end
 end

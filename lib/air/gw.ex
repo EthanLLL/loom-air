@@ -52,7 +52,7 @@ defmodule Air.Gw do
   @doc "Streams speech for `text`; `sink.(pcm_binary)` per chunk. Returns :ok or {:error, _}."
   def speak(text, voice, temperature, sink) do
     body = %{
-      model: model(), input: text, voice: voice, response_format: "pcm", stream: true, stream_format: "audio",
+      model: model(), input: one_line(text), voice: voice, response_format: "pcm", stream: true, stream_format: "audio",
       extra_params: %{temperature: temperature}
     }
 
@@ -76,5 +76,17 @@ defmodule Air.Gw do
       {:error, e, _} -> {:error, inspect(e)}
       {:error, e} -> {:error, inspect(e)}
     end
+  end
+
+  # The TTS reads only one paragraph of a text with line breaks, so join the lines, ending each with a full
+  # stop unless it already ends in punctuation.
+  @doc false
+  def one_line(text) do
+    text
+    |> String.split(~r/\s*\n\s*/u, trim: true)
+    |> Enum.reduce("", fn
+      line, "" -> line
+      line, acc -> if String.match?(acc, ~r/[[:punct:]。！？，、；：…]$/u), do: acc <> line, else: acc <> "。" <> line
+    end)
   end
 end

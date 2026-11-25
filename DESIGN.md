@@ -5,7 +5,7 @@ loop (the operator) that answers in the user's voice persona, hands work to Loom
 through infer-gw. Loom stays API-only; infer-gw knows nothing about tenants.
 
 ```
-phone / web UI ──ws──▶ Air.Call (one per call) ──Bedrock Converse──▶ Haiku 5.5
+phone / web UI ──ws──▶ Air.Call (one per call) ──Bedrock Converse──▶ Sonnet 5.5
                           │   ├─ HTTP + /socket ─▶ the tenant's Loom (Air.Loom, Air.LoomSocket per tenant)
                           │   └─ /gw/warm, /gw/status, /v1/audio/speech (stream, pcm) ─▶ infer-gw
                           └──ws──▶ text log + PCM frames + clip cues back to the client
@@ -13,20 +13,34 @@ phone / web UI ──ws──▶ Air.Call (one per call) ──Bedrock Converse�
 
 ## The operator
 
-**Model:** `us.anthropic.claude-haiku-5-5` on Bedrock (us-west-2, the host's role), Converse, non-streaming.
+**Model:** `us.anthropic.claude-sonnet-5-5` on Bedrock (us-west-2, the host's role), Converse, non-streaming, adaptive thinking at
+effort `low`: easy turns don't think, and thinking blocks are kept in the history but never spoken. Not `between_tools`
+(Sonnet 5.5's thinking-off): with it the model wrote notes to itself before tool calls as text, which got spoken. Sonnet over Haiku since a replay of a
+real call against five models (2026-11-25): Haiku is faster per call but less reliable with tools over several turns;
+Sonnet got every step right, twice. Non-streaming on purpose: ConverseStream has been flaky on Bedrock and would save
+only ~100–300 ms.
 Replies are one or two short sentences, so streaming the model buys little; TTS streams instead. Every call's
 `usage` goes to `data/usage.jsonl`.
 
 **What it says:** the text of a response *is* what gets spoken. Text and tool calls in one response: the text is
-spoken first, then the tools run. While TTS is not ready, text is shown in the log but not spoken, so the
-operator is told to use clips then.
+spoken first, then the tools run. Thinking is never spoken, and thinking blocks are not kept in the history (each
+is bound to the exact prompt and tools it was made under, and those change once per call, below).
+
+**Two phases (user, 2026-11-25):** a call is *cold* until TTS is ready, then *warm* for the rest of the call. Each
+turn takes the phase TTS is in when it starts, with that phase's system prompt and tools:
+
+- cold: only clips can be heard, so the prompt says so and `play_clip` is in the tools; text is logged, not spoken.
+- warm: everything is spoken through TTS, and `play_clip` is gone, so there is no clip to reach for.
+
+Switching changes the tool list, which comes first in the request, so that one round is not cached; switching the
+prompt at the same time costs nothing more.
 
 **Tools:**
 
 | tool | what |
 | --- | --- |
-| `play_clip {name}` | a pre-recorded clip of the voice (greetings, acks, "wait a moment", goodbye); instant, works while TTS is cold. The names and their words are in the tool description. |
-| `read_session {session_id}` | a session's status and its last few user / assistant messages |
+| `play_clip {kind}` | cold phase only. A pre-recorded clip of the voice, picked at random from the kind (greet, ack, handoff, wait, booting, done, sorry, bye: the name prefixes of the clip files, `greet_2` → greet); the result says which words were played. Adding a clip is adding a file. |
+| `read_sessions {session_ids}` | status and latest messages: the last few for one session, the last reply (300 chars) each for several, so "keep an eye on these ten" is one call and one round |
 | `send_to_session {session_id, text}` | submit a message to an existing session; returns at once, the reply comes later as an event |
 | `new_session {title, prompt}` | start a new Loom session with that prompt; the reply comes later as an event |
 | `end_call {}` | hang up after saying goodbye |
@@ -86,12 +100,16 @@ Air.Application
 ```
 
 - **Air.Call** (GenServer, one per call, monitors its socket): `tenant`, `messages`, `pending` events, `turn`
-  (Task ref or nil), `speech` queue + the Task streaming the current item, `tts` state, `tasks` (Loom work
-  in flight). Dial → `/gw/warm`, poll `/gw/status` every 3 s until ready, then every 15 s. A turn is a Task
+  (Task ref or nil), `speech` queue + the Task streaming the current item, `tts` state, `following` (the
+  sessions it follows; the running ones, from the lobby list, are the `<state>` tag's Loom tasks). Dial → `/gw/warm`, poll `/gw/status` every 3 s until ready, then every 15 s. A turn is a Task
   (model call + tool loop, ≤ 6 rounds) so the Call keeps handling events; results come back as messages.
 - **Air.LoomSocket** (GenServer per tenant): one Mint.WebSocket to the Loom's `/socket` (Phoenix v2 JSON),
-  heartbeat every 30 s. `watch(session, client_msg_id, pid)` joins `agent:<id>` from its current seq; when the
-  `user` event with that `client_msg_id` is followed by `turn_done`, the last `assistant_text` goes to `pid`.
+  heartbeat every 30 s. **Follows sessions per call (user, 2026-11-25):** `read_sessions`, `send_to_session` and
+  `new_session` each `subscribe(session, since_seq, call)`; a call follows a session at most once, so nothing is
+  delivered twice. Every `turn_done` of a followed session sends that turn's last `assistant_text` to the call,
+  once, whoever started the turn (a message steered into a running turn, then answered by the next one, gives
+  two replies, each once). Submits subscribe from the seq before the submit, so the reply cannot slip past.
+  Calls are monitored; a call that ends drops its subscriptions.
   `read(session)` joins from `seq - 80` and returns the snapshot. It also joins the lobby (`agents`) and keeps
   the session list current from its pushes. Push, not polling. The list is not put in the system prompt: it
   changes every turn and would break the cache, so the call sends it whole once and then only the diffs.
