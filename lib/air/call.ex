@@ -24,10 +24,12 @@ defmodule Air.Call do
 
     s = %{
       t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
-      speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0, told: %{},
+      speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0, told: %{}, log: log_path(t),
       ctx: %{t: t, clips: clips, call: self(), system: Operator.system(t, clips), tools: Operator.tools(clips)}
     }
 
+    record(s, %{type: "call_start", tenant: t["name"], voice: t["voice"], temperature: t["temperature"],
+      model: Config.get(:model)})
     {:ok, s, {:continue, :dial}}
   end
 
@@ -44,6 +46,7 @@ defmodule Air.Call do
       _ -> s
     end
 
+    record(s, %{type: "tts", state: s.tts.state, up_s: s.tts.up_s})
     state(s)
     Process.send_after(self(), :poll, 3_000)
     {:noreply, s |> event("<call_started/>") |> sessions_list() |> flush()}
@@ -137,8 +140,12 @@ defmodule Air.Call do
     Process.demonitor(ref, [:flush])
 
     s = case result do
-      {:ok, st} -> %{s | tts: st}
-      _ -> s
+      {:ok, st} ->
+        if st.state != s.tts.state, do: record(s, %{type: "tts", state: st.state, up_s: st.up_s})
+        %{s | tts: st}
+
+      _ ->
+        s
     end
 
     state(s)
@@ -171,6 +178,7 @@ defmodule Air.Call do
   defp flush(%{turn: nil, pending: [_ | _], ending: false} = s) do
     {changed, s} = sessions_changed(s)
     text = Enum.join([state_tag(s) | changed] ++ s.pending, "\n")
+    record(s, %{type: "turn_in", text: text})
     messages = append_user(s.messages, %{text: text})
     ctx = s.ctx
     task = Task.Supervisor.async_nolink(Air.Tasks, fn -> Operator.turn(ctx, messages) end)
@@ -293,10 +301,34 @@ defmodule Air.Call do
 
   defp out(s, %{type: "error", text: t} = msg) do
     Logger.error("call #{s.t["name"]}: #{t}")
+    record(s, msg)
     send(s.socket, {:send, msg})
   end
 
-  defp out(s, msg), do: send(s.socket, {:send, msg})
+  # Cues and state ticks are not worth keeping; TTS changes are recorded where they happen.
+  defp out(s, %{type: type} = msg) do
+    if type not in ~w(state speech speech_end clip), do: record(s, msg)
+    send(s.socket, {:send, msg})
+  end
+
+  # ── the call's record: data/calls/<tenant>/<UTC start>.jsonl, one event per line, appended as it happens ──
+
+  defp log_path(t) do
+    dir = Path.join([Config.data(), "calls", t["name"]])
+    File.mkdir_p!(dir)
+    stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S")
+    Path.join(dir, stamp <> ".jsonl")
+  end
+
+  defp record(s, event) do
+    line = Jason.encode!(Map.put(event, :at, System.system_time(:millisecond))) <> "\n"
+    File.write(s.log, line, [:append])
+  end
+
+  @impl true
+  def terminate(reason, s) do
+    record(s, %{type: "call_end", reason: inspect(reason)})
+  end
 
   defp state(s) do
     out(s, %{type: "state", tts: s.tts.state, up_s: s.tts.up_s, tasks: s.tasks |> Map.values()})
