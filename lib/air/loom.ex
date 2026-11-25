@@ -1,7 +1,7 @@
 defmodule Air.Loom do
-  @moduledoc "A tenant's Loom over HTTP: list, create and submit. Results come back through `Air.LoomSocket`."
+  @moduledoc "A tenant's Loom over HTTP: create and submit. The list and the results come through `Air.LoomSocket`."
 
-  defp req(t, method, path, body \\ nil) do
+  defp req(t, method, path, body) do
     headers = [{"authorization", "Bearer " <> t["loom_token"]}, {"content-type", "application/json"}]
     body = body && Jason.encode!(body)
 
@@ -9,21 +9,6 @@ defmodule Air.Loom do
       {:ok, %{status: s, body: b}} when s in 200..299 -> {:ok, Jason.decode!(b)}
       {:ok, %{status: s, body: b}} -> {:error, "loom #{s}: #{String.slice(b, 0, 200)}"}
       {:error, e} -> {:error, "loom: #{inspect(e)}"}
-    end
-  end
-
-  def sessions(t) do
-    with {:ok, %{"sessions" => list}} <- req(t, :get, "/api/agents") do
-      {:ok, Enum.sort_by(list, &(&1["last_active_at"] || 0), :desc)}
-    end
-  end
-
-  def session(t, id) do
-    with {:ok, list} <- sessions(t) do
-      case Enum.find(list, &(&1["id"] == id)) do
-        nil -> {:error, "no session #{id}"}
-        s -> {:ok, s}
-      end
     end
   end
 

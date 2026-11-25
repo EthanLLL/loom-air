@@ -24,7 +24,7 @@ defmodule Air.Call do
 
     s = %{
       t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
-      speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0,
+      speaking: nil, tts: %{state: :off, up_s: 0}, tasks: %{}, polls: nil, ending: false, n: 0, told: %{},
       ctx: %{t: t, clips: clips, call: self(), system: Operator.system(t, clips), tools: Operator.tools(clips)}
     }
 
@@ -46,7 +46,7 @@ defmodule Air.Call do
 
     state(s)
     Process.send_after(self(), :poll, 3_000)
-    {:noreply, s |> event("<call_started/>") |> flush()}
+    {:noreply, s |> event("<call_started/>") |> sessions_list() |> flush()}
   end
 
   @impl true
@@ -169,7 +169,8 @@ defmodule Air.Call do
   defp event(s, text), do: %{s | pending: s.pending ++ [text]}
 
   defp flush(%{turn: nil, pending: [_ | _], ending: false} = s) do
-    text = Enum.join([state_tag(s) | s.pending], "\n")
+    {changed, s} = sessions_changed(s)
+    text = Enum.join([state_tag(s) | changed] ++ s.pending, "\n")
     messages = append_user(s.messages, %{text: text})
     ctx = s.ctx
     task = Task.Supervisor.async_nolink(Air.Tasks, fn -> Operator.turn(ctx, messages) end)
@@ -185,6 +186,63 @@ defmodule Air.Call do
       _ -> messages ++ [%{role: "user", content: [block]}]
     end
   end
+
+  # ── the session list: whole at the start, then only what changed, so the prefix stays cached ──
+
+  @list_max 30
+
+  defp sessions_list(s) do
+    case Air.LoomSocket.sessions(s.t) do
+      {:ok, list} ->
+        now = System.system_time(:millisecond)
+        list = Enum.sort_by(list, &(&1["last_active_at"] || 0), :desc)
+        {shown, rest} = Enum.split(list, @list_max)
+
+        lines =
+          Enum.map(shown, &"- #{&1["id"]} 「#{&1["title"]}」 #{status(&1)}, #{ago(now - (&1["last_active_at"] || now))}")
+
+        more = if rest == [], do: [], else: ["(#{length(rest)} older not listed)"]
+        event(%{s | told: told(list)}, Enum.join(["<sessions>" | lines] ++ more ++ ["</sessions>"], "\n"))
+
+      {:error, e} ->
+        out(s, %{type: "error", text: "session list: #{inspect(e)}"})
+        s
+    end
+  end
+
+  defp sessions_changed(s) do
+    case Air.LoomSocket.sessions(s.t) do
+      {:ok, list} ->
+        now = told(list)
+
+        diff =
+          Enum.flat_map(now, fn {id, {title, st}} ->
+            case s.told[id] do
+              nil -> ["new #{id} 「#{title}」 #{st}"]
+              {^title, ^st} -> []
+              {^title, _} -> ["#{id} 「#{title}」 now #{st}"]
+              {old, _} -> ["#{id} 「#{old}」 renamed 「#{title}」, #{st}"]
+            end
+          end) ++ for({id, {title, _}} <- s.told, not Map.has_key?(now, id), do: "removed #{id} 「#{title}」")
+
+        tag = if diff == [], do: [], else: ["<sessions_changed>" <> Enum.join(diff, "; ") <> "</sessions_changed>"]
+        {tag, %{s | told: now}}
+
+      _ ->
+        {[], s}
+    end
+  end
+
+  defp told(list), do: Map.new(list, &{&1["id"], {&1["title"], status(&1)}})
+
+  # starting/running are one thing to the operator; fewer flips, fewer diffs.
+  defp status(%{"status" => st}) when st in ["starting", "running"], do: "running"
+  defp status(%{"status" => st}), do: to_string(st)
+
+  defp ago(ms) when ms < 60_000, do: "just now"
+  defp ago(ms) when ms < 3_600_000, do: "#{div(ms, 60_000)} min ago"
+  defp ago(ms) when ms < 86_400_000, do: "#{div(ms, 3_600_000)} h ago"
+  defp ago(ms), do: "#{div(ms, 86_400_000)} d ago"
 
   defp state_tag(s) do
     tts =

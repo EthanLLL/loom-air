@@ -7,6 +7,8 @@ defmodule Air.LoomSocket do
     submit's `client_msg_id`; the `turn_done` after it sends `{:loom_reply, id, last_assistant_text}` to the
     watcher.
   - `read/3` joins from an earlier seq and returns the snapshot's events.
+  - `sessions/1` is the session list, kept current from the lobby channel (`agents`: the whole list in the
+    join reply, then `session` / `removed` pushes), so nobody has to ask Loom for it.
 
   A topic stays joined while it has watchers. Events are deduplicated by seq per topic, so a re-join (Phoenix
   replaces a duplicate join) or a reconnect never delivers twice. On a dropped connection it reconnects and
@@ -33,6 +35,11 @@ defmodule Air.LoomSocket do
     GenServer.call(s, {:watch, session, since_seq, client_msg_id, pid}, 20_000)
   end
 
+  def sessions(t) do
+    {:ok, s} = start(t)
+    GenServer.call(s, :sessions, 20_000)
+  end
+
   def read(t, session, since_seq) do
     {:ok, s} = start(t)
     GenServer.call(s, {:read, session, since_seq}, 20_000)
@@ -43,11 +50,16 @@ defmodule Air.LoomSocket do
   @impl true
   def init(t) do
     send(self(), :connect)
-    {:ok, %{t: t, conn: nil, ws: nil, ref: nil, open: false, n: 0, topics: %{}, watches: %{}, waiting: %{}, later: []}}
+    {:ok, %{t: t, conn: nil, ws: nil, ref: nil, open: false, n: 0, topics: %{}, watches: %{}, waiting: %{}, later: [],
+      lobby: nil, sessions: %{}}}
   end
 
   @impl true
   def handle_call(op, from, %{open: false} = s), do: {:noreply, %{s | later: s.later ++ [{op, from}]}}
+
+  # Until the lobby's join reply is in, the list is not known yet.
+  def handle_call(:sessions, from, %{lobby: {:joining, _}} = s), do: {:noreply, %{s | later: s.later ++ [{:sessions, from}]}}
+  def handle_call(:sessions, _from, s), do: {:reply, {:ok, Map.values(s.sessions)}, s}
 
   def handle_call({:watch, id, since, cmid, pid}, from, s) do
     topic = "agent:" <> id
@@ -105,6 +117,8 @@ defmodule Air.LoomSocket do
       {:ok, conn, ws} ->
         Process.send_after(self(), :heartbeat, @heartbeat)
         s = %{s | conn: conn, ws: ws, open: true}
+        r = ref(s)
+        s = push(s, [r, r, "agents", "phx_join", %{}]) |> bump() |> Map.put(:lobby, {:joining, r})
         # Re-join what was joined before the drop, then run what waited for the connection.
         s = Enum.reduce(s.topics, %{s | topics: %{}}, fn {topic, %{last: last}}, s -> join(s, topic, last, nil) end)
         Enum.reduce(s.later, %{s | later: []}, fn {op, from}, s -> {:noreply, s} = handle_call(op, from, s); s end)
@@ -127,6 +141,23 @@ defmodule Air.LoomSocket do
   defp frame({:ping, d}, s), do: send_frame(s, {:pong, d})
   defp frame({:close, _, _}, s), do: dropped(s, :closed)
   defp frame(_, s), do: s
+
+  defp message([_, ref, "agents", "phx_reply", %{"status" => "ok", "response" => resp}], %{lobby: {:joining, ref}} = s) do
+    s = %{s | lobby: ref, sessions: Map.new(resp["sessions"] || [], &{&1["id"], &1})}
+    {later, rest} = Enum.split_with(s.later, &match?({:sessions, _}, &1))
+    for {:sessions, from} <- later, do: GenServer.reply(from, {:ok, Map.values(s.sessions)})
+    %{s | later: rest}
+  end
+
+  # Keep whichever copy has the higher seq: a push can arrive after a newer join reply.
+  defp message([jref, _, "agents", "session", %{"id" => id} = sum], %{lobby: jref} = s) do
+    if (get_in(s.sessions, [id, "seq"]) || -1) <= (sum["seq"] || 0),
+      do: put_in(s.sessions[id], sum),
+      else: s
+  end
+
+  defp message([jref, _, "agents", "removed", %{"id" => id}], %{lobby: jref} = s),
+    do: %{s | sessions: Map.delete(s.sessions, id)}
 
   defp message([_jref, ref, topic, "phx_reply", %{"status" => st, "response" => resp}], s) do
     case Map.pop(s.waiting, ref) do
@@ -225,6 +256,6 @@ defmodule Air.LoomSocket do
     if s.conn, do: Mint.HTTP.close(s.conn)
     for {_, {_, {_, from}}} <- s.waiting, do: GenServer.reply(from, {:error, :disconnected})
     Process.send_after(self(), :connect, 2_000)
-    %{s | conn: nil, ws: nil, ref: nil, open: false, waiting: %{}}
+    %{s | conn: nil, ws: nil, ref: nil, open: false, waiting: %{}, lobby: nil}
   end
 end

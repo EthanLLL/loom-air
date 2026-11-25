@@ -26,17 +26,23 @@ operator is told to use clips then.
 | tool | what |
 | --- | --- |
 | `play_clip {name}` | a pre-recorded clip of the voice (greetings, acks, "wait a moment", goodbye); instant, works while TTS is cold. The names and their words are in the tool description. |
-| `list_sessions {}` | the Loom's recent sessions: id, title, status, last active |
 | `read_session {session_id}` | a session's status and its last few user / assistant messages |
 | `send_to_session {session_id, text}` | submit a message to an existing session; returns at once, the reply comes later as an event |
 | `new_session {title, prompt}` | start a new Loom session with that prompt; the reply comes later as an event |
 | `end_call {}` | hang up after saying goodbye |
+
+**Fewest rounds (user, 2026-11-25):** latency-sensitive, so few tools and few tool rounds. The session list is
+not a tool: it comes from the lobby channel and goes into the conversation (below). After `play_clip`,
+`end_call`, `send_to_session` and `new_session` the model is not asked again (it speaks before them); only a
+failure goes back to it.
 
 **What it hears** — every user-role message is built by Air from events, never typed by the model:
 
 ```
 <state tts="ready | warming 35s | launching | off" tasks="1 running: <title>"/>
 <call_started/>                                  the user dialled
+<sessions>- id 「title」 running, 2 min ago …</sessions>   once, at the start (≤ 30, newest first)
+<sessions_changed>new …; … now idle; removed …</sessions_changed>   at the top of a turn, only when something changed
 <heard>…</heard>                                 the phone's transcript (may have ASR errors)
 <loom_reply session="…" title="…">…</loom_reply>   a session finished the turn Air submitted
 <loom_error session="…">…</loom_error>
@@ -69,7 +75,9 @@ Air.Application
 - **Air.LoomSocket** (GenServer per tenant): one Mint.WebSocket to the Loom's `/socket` (Phoenix v2 JSON),
   heartbeat every 30 s. `watch(session, client_msg_id, pid)` joins `agent:<id>` from its current seq; when the
   `user` event with that `client_msg_id` is followed by `turn_done`, the last `assistant_text` goes to `pid`.
-  `read(session)` joins from `seq - 60` and returns the snapshot. Push, not polling.
+  `read(session)` joins from `seq - 80` and returns the snapshot. It also joins the lobby (`agents`) and keeps
+  the session list current from its pushes. Push, not polling. The list is not put in the system prompt: it
+  changes every turn and would break the cache, so the call sends it whole once and then only the diffs.
 - **TTS**: one item at a time. `{:tts, text}` streams `/v1/audio/speech` (`voice`, `response_format: pcm`,
   `stream: true`, 24 kHz s16le mono) to the socket as binary frames between `speech` / `speech_end`;
   `{:clip, name}` sends a cue the client plays from its preloaded clips. The client keeps one timeline.

@@ -5,6 +5,7 @@ defmodule Air.Operator do
   `{:task, …}`, `{:log, …}`) and loops while the model asks for tools. It returns the new messages.
   """
   @max_rounds 6
+  @final ~w(play_clip end_call send_to_session new_session)
 
   def system(t, clips) do
     keywords = Enum.join(t["keywords"] || [], "、")
@@ -27,12 +28,15 @@ defmodule Air.Operator do
     in a sentence or two and say the details are in the session.
 
     What to do:
+    - When they ask for Loom or a session by name, do exactly that, even if you could answer yourself.
     - Small talk and questions you can answer from general knowledge: answer yourself.
     - Anything that needs real work (their files, machines, code, data, the web, anything you would have to \
-    guess): hand it to Loom. Use send_to_session when it clearly continues an existing session (list_sessions \
-    and read_session help you find it), otherwise new_session. Write the prompt for an agent: full sentences in \
-    Chinese, self-contained, with what they asked and any detail they gave. Then tell them briefly that it's \
-    handed over. The reply comes later as <loom_reply>; then tell them the gist.
+    guess): hand it to Loom. Use send_to_session when it clearly continues an existing session, otherwise \
+    new_session. Write the prompt for an agent: full sentences in Chinese, self-contained, with what they asked \
+    and any detail they gave. In the same reply, before the tool call, tell them briefly that you're handing it \
+    over: nothing is said after it. The reply comes later as <loom_reply>; then tell them the gist.
+    - Their sessions are listed in <sessions> when the call starts; <sessions_changed> brings what changed since. \
+    Answer questions about which sessions exist or run from that, without a tool.
     - Asked about progress: read_session, never invent what a session did. Never submit the same thing twice, \
     never send chit-chat to Loom.
 
@@ -57,7 +61,6 @@ defmodule Air.Operator do
     [
       tool("play_clip", "Play a pre-recorded clip in the persona's voice. Instant, works while TTS is cold.",
         %{name: %{type: "string", enum: names}}, ["name"]),
-      tool("list_sessions", "The Loom's most recent sessions: id, title, status (idle/running), last active.", %{}, []),
       tool("read_session", "A session's status and its last few user and assistant messages.",
         %{session_id: %{type: "string"}}, ["session_id"]),
       tool("send_to_session", "Send a message to an existing session. Returns at once; the reply comes later as <loom_reply>.",
@@ -106,11 +109,13 @@ defmodule Air.Operator do
           end)
 
         names = for %{toolUse: %{name: name}} <- content, do: name
+        failed = Enum.any?(results, &match?(%{toolResult: %{status: "error"}}, &1))
 
         cond do
-          # A clip or a hang-up needs no follow-up from the model; asking anyway made it narrate
-          # ("Greeting played."). The results still go into the history, merged with the next events.
-          results != [] and Enum.all?(names, &(&1 in ["play_clip", "end_call"])) ->
+          # These tools need no follow-up from the model: what to say was said before them, and asking
+          # anyway costs a round and made it narrate ("Greeting played."). A failure goes back to it, so it
+          # can tell the user. The results stay in the history, merged with the next events.
+          results != [] and not failed and Enum.all?(names, &(&1 in @final)) ->
             {:ok, messages ++ [%{role: "user", content: results}]}
 
           stop == "tool_use" and results != [] and n < @max_rounds ->
@@ -167,20 +172,8 @@ defmodule Air.Operator do
     {:ok, "hanging up"}
   end
 
-  defp tool_call(ctx, "list_sessions", _) do
-    with {:ok, list} <- Air.Loom.sessions(ctx.t) do
-      now = System.system_time(:millisecond)
-
-      {:ok,
-       list
-       |> Enum.take(15)
-       |> Enum.map(&%{id: &1["id"], title: &1["title"], status: &1["status"],
-         last_active: ago(now - (&1["last_active_at"] || now))})}
-    end
-  end
-
   defp tool_call(ctx, "read_session", %{"session_id" => id}) do
-    with {:ok, s} <- Air.Loom.session(ctx.t, id),
+    with {:ok, s} <- session(ctx, id),
          {:ok, snap} <- Air.LoomSocket.read(ctx.t, id, max((s["seq"] || 0) - 80, 0)) do
       msgs =
         for %{"kind" => k, "payload" => p} <- snap["events"], k in ["user", "assistant_text"], (p["text"] || "") != "" do
@@ -192,7 +185,7 @@ defmodule Air.Operator do
   end
 
   defp tool_call(ctx, "send_to_session", %{"session_id" => id, "text" => text}) do
-    with {:ok, s} <- Air.Loom.session(ctx.t, id) do
+    with {:ok, s} <- session(ctx, id) do
       submit(ctx, id, s["title"], s["seq"] || 0, text)
     end
   end
@@ -205,6 +198,15 @@ defmodule Air.Operator do
 
   defp tool_call(_ctx, name, _), do: {:error, "unknown tool #{name}"}
 
+  defp session(ctx, id) do
+    with {:ok, list} <- Air.LoomSocket.sessions(ctx.t) do
+      case Enum.find(list, &(&1["id"] == id)) do
+        nil -> {:error, "no session #{id}"}
+        s -> {:ok, s}
+      end
+    end
+  end
+
   # Watch first, from the seq before the submit, so the reply cannot slip past.
   defp submit(ctx, id, title, seq, text) do
     cmid = "air_" <> Base.url_encode64(:crypto.strong_rand_bytes(6), padding: false)
@@ -215,9 +217,4 @@ defmodule Air.Operator do
       {:ok, %{session_id: id, status: disposition}}
     end
   end
-
-  defp ago(ms) when ms < 60_000, do: "just now"
-  defp ago(ms) when ms < 3_600_000, do: "#{div(ms, 60_000)} min ago"
-  defp ago(ms) when ms < 86_400_000, do: "#{div(ms, 3_600_000)} h ago"
-  defp ago(ms), do: "#{div(ms, 86_400_000)} d ago"
 end
