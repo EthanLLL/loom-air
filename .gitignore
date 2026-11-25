@@ -3,3 +3,4 @@ deps/
 data/
 *.ez
 .env
+__pycache__/
