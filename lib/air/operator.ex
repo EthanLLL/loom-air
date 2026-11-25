@@ -102,11 +102,41 @@ defmodule Air.Operator do
       %{kind: %{type: "string", enum: Enum.map(kinds, &elem(&1, 0))}}, ["kind"])
   end
 
+  @doc """
+  A cold history as the user heard it, for the first warm turn: every play_clip call becomes the words it
+  played, as the operator's own text, and its result goes; failed calls go, and so does the text the operator
+  wrote, which nobody heard. Messages left empty go, and neighbours of one role merge.
+  """
+  def spoken(messages) do
+    played =
+      for %{role: "user", content: c} <- messages, %{toolResult: %{toolUseId: id} = r} <- c, into: %{} do
+        {id, with(%{content: [%{json: %{result: "played 「" <> rest}}]} <- r, do: String.trim_trailing(rest, "」"), else: (_ -> nil))}
+      end
+
+    clips = for %{role: "assistant", content: c} <- messages, %{toolUse: %{name: "play_clip", toolUseId: id}} <- c, into: MapSet.new(), do: id
+
+    messages
+    |> Enum.map(fn m ->
+      content =
+        Enum.flat_map(m.content, fn
+          %{toolUse: %{toolUseId: id}} = b -> if id in clips, do: (if t = played[id], do: [%{text: t}], else: []), else: [b]
+          %{toolResult: %{toolUseId: id}} = b -> if id in clips, do: [], else: [b]
+          %{text: _} when m.role == "assistant" -> []
+          b -> [b]
+        end)
+
+      %{m | content: content}
+    end)
+    |> Enum.reject(&(&1.content == []))
+    |> Enum.chunk_by(& &1.role)
+    |> Enum.map(fn [m | _] = ms -> %{m | content: Enum.flat_map(ms, & &1.content)} end)
+  end
+
   def kind(%{"name" => name}), do: String.replace(name, ~r/_\d+$/, "")
 
   defp tool(name, desc, props, required) do
-    %{toolSpec: %{name: name, description: desc,
-      inputSchema: %{json: %{type: "object", properties: props, required: required}}}}
+    %{toolSpec: %{name: name, description: desc, strict: true,
+      inputSchema: %{json: %{type: "object", properties: props, required: required, additionalProperties: false}}}}
   end
 
   @doc "Runs one turn on `messages` (ending with a user message). Returns `{:ok, messages}` or `{:error, reason, messages}`."
@@ -177,9 +207,13 @@ defmodule Air.Operator do
   defp clean(other), do: other
 
   defp run(ctx, %{toolUseId: id, name: name, input: input}) do
+    # The model may still call a tool it saw earlier in the call but no longer has (play_clip after warm-up,
+    # copying its own history), and Bedrock lets that through. Refuse it; the error sends it back for a round.
     result =
       try do
-        tool_call(ctx, name, input)
+        if Enum.any?(ctx.tools, &(&1.toolSpec.name == name)),
+          do: tool_call(ctx, name, input),
+          else: {:error, "#{name} is not available now: speech synthesis is ready, say it as text"}
       rescue
         e -> {:error, Exception.message(e)}
       end

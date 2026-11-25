@@ -35,6 +35,12 @@ turn takes the phase TTS is in when it starts, with that phase's system prompt a
 Switching changes the tool list, which comes first in the request, so that one round is not cached; switching the
 prompt at the same time costs nothing more.
 
+Removing the tool is not enough: with its own play_clip calls in the history, the model kept calling it once warm
+(Bedrock does not hold it to the tool list), and copied the notes it had written as text while nobody heard them.
+So the first warm turn also rewrites the history to what the user heard (`Operator.spoken/1`): each clip becomes
+its words as the operator's text, unheard text goes. That round is uncached anyway; later rounds cache as before.
+Behind that, tools are `strict` and a call to a tool not in the phase's list is refused, not run.
+
 **Tools:**
 
 | tool | what |

@@ -138,7 +138,8 @@ round = fn round, m, {system, tools}, messages, n, acc ->
       calls =
         for %{toolUse: u} <- content do
           # play_clip also says which clip it picked, for the report.
-          case tool.(u.name, u.input) do
+          # As in production: a tool not offered in this phase is refused.
+          case if(Enum.any?(tools, &(&1.toolSpec.name == u.name)), do: tool.(u.name, u.input), else: {:error, "#{u.name} is not available now"}) do
             {:ok, d, clip} -> {Map.put(u, :clip, clip), {:ok, d}}
             res -> {u, res}
           end
@@ -195,6 +196,9 @@ runs =
 
     {_, turns} =
       Enum.reduce(inputs, {[], []}, fn input, {messages, turns} ->
+        # As in production: warm, the clips played so far become plain text (NOSPOKEN=1 to skip).
+        first_warm = phase_of.(input) == :warm and Enum.all?(turns, &(&1.phase == :cold))
+        messages = if(first_warm and !System.get_env("NOSPOKEN"), do: Air.Operator.spoken(messages), else: messages)
         messages = append_user.(messages, %{text: input})
         {messages, rounds} = round.(round, m, phases[phase_of.(input)], messages, 1, [])
         for r <- rounds, do: IO.puts("  #{r.ms} ms  #{inspect(r[:says] || r[:error])} #{inspect(for x <- r[:tools] || [], do: x.name)}")

@@ -24,7 +24,7 @@ defmodule Air.Call do
 
     s = %{
       t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
-      speaking: nil, tts: %{state: :off, up_s: 0}, following: MapSet.new(), polls: nil, ending: false, n: 0, told: %{}, log: log_path(t),
+      speaking: nil, tts: %{state: :off, up_s: 0}, following: MapSet.new(), polls: nil, warm: false, ending: false, n: 0, told: %{}, log: log_path(t),
       ctx: %{t: t, clips: clips, call: self()}, phases: phases(t, clips)
     }
 
@@ -178,7 +178,10 @@ defmodule Air.Call do
     text = Enum.join([state_tag(s) | changed] ++ s.pending, "\n")
     phase = if s.tts.state == :ready, do: :warm, else: :cold
     record(s, %{type: "turn_in", phase: phase, text: text})
-    messages = append_user(s.messages, %{text: text})
+    # On the first warm turn the history becomes what the user heard (see Operator.spoken/1); left as it was,
+    # the model kept calling play_clip after the tool was gone, and spoke like its unheard cold-phase notes.
+    {messages, s} = if(phase == :warm and not s.warm, do: {Operator.spoken(s.messages), %{s | warm: true}}, else: {s.messages, s})
+    messages = append_user(messages, %{text: text})
     ctx = Map.merge(s.ctx, s.phases[phase])
     task = Task.Supervisor.async_nolink(Air.Tasks, fn -> Operator.turn(ctx, messages) end)
     %{s | turn: task.ref, pending: []}
