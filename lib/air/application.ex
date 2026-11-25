@@ -4,7 +4,9 @@ defmodule Air.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Finch, name: Air.Finch, pools: %{default: [size: 20]}},
+      # The NAT drops a connection idle for 350 s without telling us; a reused dead one hangs until the
+      # receive timeout. Close idle ones well before that.
+      {Finch, name: Air.Finch, pools: %{default: [size: 20, conn_max_idle_time: 60_000]}},
       {Registry, keys: :unique, name: Air.Registry},
       {DynamicSupervisor, name: Air.Sup, strategy: :one_for_one},
       {Task.Supervisor, name: Air.Tasks},

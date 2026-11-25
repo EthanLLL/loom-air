@@ -40,8 +40,8 @@ defmodule Air.Operator do
     answer with play_clip only (pick the one that fits, vary them) and write no text. When it is ready, speak \
     with text and use a clip only when one fits exactly.
 
-    Text after a tool result is spoken too, so never narrate what you did ("clip played", "submitted"): after \
-    a tool, write only what you would say to them, or nothing.
+    Text after a tool result is spoken too, so never narrate what you did ("submitted", "checked"): after a \
+    tool, write only what you would say to them, or nothing.
 
     <call_started/>: they just dialled; greet them with a greeting clip.
     When they say goodbye: say goodbye (a clip or text), then end_call.
@@ -105,7 +105,14 @@ defmodule Air.Operator do
             _ -> []
           end)
 
+        names = for %{toolUse: %{name: name}} <- content, do: name
+
         cond do
+          # A clip or a hang-up needs no follow-up from the model; asking anyway made it narrate
+          # ("Greeting played."). The results still go into the history, merged with the next events.
+          results != [] and Enum.all?(names, &(&1 in ["play_clip", "end_call"])) ->
+            {:ok, messages ++ [%{role: "user", content: results}]}
+
           stop == "tool_use" and results != [] and n < @max_rounds ->
             round(ctx, messages ++ [%{role: "user", content: results}], n + 1)
 

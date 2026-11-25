@@ -8,6 +8,7 @@ defmodule Air.Call do
   One speech item at a time, in order; the client plays them on one timeline.
   """
   use GenServer, restart: :temporary
+  require Logger
 
   alias Air.{Config, Gw, Operator}
 
@@ -231,6 +232,11 @@ defmodule Air.Call do
   end
 
   defp next_speech(s), do: s
+
+  defp out(s, %{type: "error", text: t} = msg) do
+    Logger.error("call #{s.t["name"]}: #{t}")
+    send(s.socket, {:send, msg})
+  end
 
   defp out(s, msg), do: send(s.socket, {:send, msg})
 
