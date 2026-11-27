@@ -1,3 +1,5 @@
+# Written for the two-phase operator (cold clips, then warm TTS), replaced by ringing on 2026-11-27: run it
+# from commit 102b734.
 # Replays a recorded call against several operator models: the same system prompt (with the memory snapshot the
 # call had), the same tools and the same turn inputs, in order. Each model keeps its own history.
 #

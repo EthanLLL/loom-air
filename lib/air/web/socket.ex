@@ -7,8 +7,7 @@ defmodule Air.Web.Socket do
 
   @impl true
   def init(t) do
-    voice = t["voice"]
-    hello = %{type: "hello", tenant: t["name"], user: t["user"], voice: voice, clips: Air.Config.clips(voice)}
+    hello = %{type: "hello", tenant: t["name"], user: t["user"], voice: t["voice"]}
     {:push, {:text, Jason.encode!(hello)}, %{t: t, call: nil}}
   end
 

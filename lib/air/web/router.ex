@@ -1,6 +1,6 @@
 defmodule Air.Web.Router do
   @moduledoc """
-  The test client: the page, the clips and `/ws`. Served as the Loom app `loom-air` (proxy all), so paths may
+  The test client: the page, the ringback, the voice's clips and `/ws`. Served as the Loom app `loom-air` (proxy all), so paths may
   carry the `/apps/loom-air` prefix. Behind the shared app login cookie (`~/app-kit/auth.ts`'s `app_session`).
   """
   use Plug.Router
@@ -21,6 +21,12 @@ defmodule Air.Web.Router do
   get "/" do
     with :ok <- authed(conn) do
       conn |> put_resp_content_type("text/html") |> send_file(200, static("index.html"))
+    end
+  end
+
+  get "/ringback.wav" do
+    with :ok <- authed(conn) do
+      conn |> put_resp_content_type("audio/wav") |> send_file(200, Air.Config.ringback_path())
     end
   end
 

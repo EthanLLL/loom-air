@@ -3,7 +3,8 @@ defmodule Air.Config do
   Files under the data directory, read on every use (they are tiny), so an edit needs no restart.
 
     tenants.json   name → %{loom_url, loom_token, voice, temperature, persona, keywords, user}
-    clips/<voice>/clips.json   [%{name, text}], next to <name>.wav
+    ringback.wav   what the phone plays while it rings (24 kHz s16le mono); its length is the ring timeout
+    clips/<voice>/no_answer.wav   the "nobody answers" announcement, in the voice
     usage.jsonl    one line per model call
   """
   def data, do: Application.fetch_env!(:air, :data)
@@ -20,10 +21,13 @@ defmodule Air.Config do
 
   def default_tenant, do: tenants() |> Map.keys() |> Enum.sort() |> hd()
 
-  def clips(voice) do
-    case File.read(Path.join([data(), "clips", voice, "clips.json"])) do
-      {:ok, s} -> Jason.decode!(s)
-      _ -> []
+  def ringback_path, do: Path.join(data(), "ringback.wav")
+
+  @doc "How long the ringback lasts, in ms: 24 kHz s16le mono after a 44-byte header."
+  def ringback_ms do
+    case File.stat(ringback_path()) do
+      {:ok, %{size: size}} -> div((size - 44) * 1000, 48_000)
+      _ -> 60_000
     end
   end
 

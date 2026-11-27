@@ -25,7 +25,7 @@
   #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
   .msg { max-width:85%; padding:9px 13px; border-radius:16px; white-space:pre-wrap; word-break:break-word; }
   .heard { align-self:flex-end; background:var(--me); border-bottom-right-radius:4px; }
-  .say, .clip { align-self:flex-start; background:var(--op); border-bottom-left-radius:4px; }
+  .say { align-self:flex-start; background:var(--op); border-bottom-left-radius:4px; }
   .say.mute { opacity:.55; }
   .tag { display:inline-block; font-size:11px; color:var(--dim); border:1px solid var(--line); border-radius:6px;
          padding:0 5px; margin-right:6px; vertical-align:1px; }
@@ -70,8 +70,9 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $("log");
-let ws, clips = {}, voice, inCall = false, ending = false;
+let ws, voice, inCall = false, ending = false;
 let ctx, playhead = 0, sources = [], rate = 24000;
+let ringBuf, noAnswerBuf, ring;
 
 const GPU = { off: "GPU 关机", launching: "GPU 申请机器中", booting: "GPU 开机中", warming: "GPU 预热中", ready: "GPU 就绪" };
 
@@ -92,28 +93,37 @@ function connect() {
   ws.onclose = () => { setCall(false); $("gpu").textContent = "断开，重连中"; $("dot").className = "dot"; setTimeout(connect, 2000); };
 }
 
-async function loadClips(list) {
-  if (!ctx) return;
-  for (const c of list) {
-    if (clips[c.name]?.buf) continue;
-    clips[c.name] = { ...c };
-    try {
-      const r = await fetch(`clips/${voice}/${c.name}.wav`);
-      clips[c.name].buf = await ctx.decodeAudioData(await r.arrayBuffer());
-    } catch (e) { add("err", `录音 ${esc(c.name)} 加载失败`); }
-  }
+async function load(path) {
+  try { return await ctx.decodeAudioData(await (await fetch(path)).arrayBuffer()); }
+  catch (e) { add("err", `${esc(path)} 加载失败`); }
+}
+async function loadAudio() {
+  ringBuf ??= await load("ringback.wav");
+  noAnswerBuf ??= await load(`clips/${voice}/no_answer.wav`);
 }
 
-let clipList = [];
+// The ringback plays outside the speech timeline, and stops the moment the call is answered.
+function startRing() {
+  if (!ringBuf) return;
+  ring = ctx.createBufferSource(); ring.buffer = ringBuf; ring.connect(ctx.destination); ring.start();
+}
+function stopRing() { if (ring) { try { ring.stop(); } catch {} ring = null; } }
+
 function onMsg(m) {
   switch (m.type) {
     case "hello":
-      voice = m.voice; clipList = m.clips;
+      voice = m.voice;
       $("who").textContent = `${m.user ?? m.tenant} · ${m.voice}`;
-      loadClips(clipList);
       break;
-    case "dialled": setCall(true); add("sys", "已接通"); break;
-    case "ended": setCall(false); add("sys", "已挂断"); break;
+    case "dialled": setCall(true); break;
+    case "ringing": startRing(); add("sys", "正在呼叫…"); break;
+    case "answered": stopRing(); setTalk(true); add("sys", "已接通"); break;
+    case "no_answer":
+      stopRing(); add("sys", "无人接听");
+      if (noAnswerBuf) schedule(noAnswerBuf);
+      whenQuiet(() => ws.send(JSON.stringify({ type: "hangup" })));
+      break;
+    case "ended": stopRing(); setCall(false); add("sys", "已挂断"); break;
     case "state": {
       $("gpu").textContent = GPU[m.tts] + (m.tts !== "ready" && m.up_s ? ` ${m.up_s}s` : "");
       $("dot").className = "dot " + (m.tts === "ready" ? "ready" : m.tts === "off" ? "" : "warm");
@@ -124,8 +134,6 @@ function onMsg(m) {
     }
     case "heard": add("msg heard", esc(m.text)); break;
     case "say": add("msg say" + (m.spoken ? "" : " mute"), (m.spoken ? "" : `<span class="tag">未朗读</span>`) + esc(m.text)); break;
-    case "clip_log": add("msg clip", `<span class="tag">录音 ${esc(m.name)}</span>${esc(m.text)}`); break;
-    case "clip": playClip(m.name); break;
     case "tool": add("tool", `→ ${esc(m.name)} ${esc(JSON.stringify(m.input))}\n  ${esc(m.result)}`); break;
     case "loom_reply": {
       const el = add("reply", `<b>Loom 回复 · ${esc(m.title || m.session)}</b><div>${esc(m.text)}</div>`);
@@ -139,7 +147,7 @@ function onMsg(m) {
   }
 }
 
-// One timeline: clips and PCM chunks are scheduled back to back in arrival order.
+// One timeline: speech chunks (and the no-answer announcement) are scheduled back to back in arrival order.
 function schedule(buf) {
   const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
   playhead = Math.max(playhead, ctx.currentTime + 0.05);
@@ -154,26 +162,29 @@ function onPcm(ab) {
   for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
   const buf = ctx.createBuffer(1, f.length, rate); buf.copyToChannel(f, 0); schedule(buf);
 }
-function playClip(name) { const c = clips[name]; if (c?.buf) schedule(c.buf); else add("err", `录音 ${esc(name)} 还没加载`); }
 function speakingUi() { $("speaking").style.display = sources.length ? "block" : "none"; }
 function whenQuiet(fn) { const wait = () => (sources.length || (ctx && playhead > ctx.currentTime)) ? setTimeout(wait, 200) : fn(); setTimeout(wait, 300); }
 function stopAudio() { for (const s of sources) try { s.stop(); } catch {} sources = []; playhead = 0; speakingUi(); }
 
 function setCall(on) {
-  inCall = on; if (!on) { ending = false; }
+  inCall = on; if (!on) { ending = false; setTalk(false); }
   $("call").classList.toggle("on", on); $("call").title = on ? "挂断" : "拨号";
+}
+// The text box opens once the call is answered: nothing said while it rings is heard.
+function setTalk(on) {
   $("text").disabled = $("send").disabled = !on;
   if (on) $("text").focus();
 }
 
 $("call").onclick = async () => {
-  if (!ctx) { ctx = new AudioContext(); await loadClips(clipList); }
+  if (!ctx) ctx = new AudioContext();
   await ctx.resume();
-  if (inCall) { stopAudio(); ws.send(JSON.stringify({ type: "hangup" })); }
+  await loadAudio();
+  if (inCall) { stopRing(); stopAudio(); ws.send(JSON.stringify({ type: "hangup" })); }
   else ws.send(JSON.stringify({ type: "dial" }));
 };
 function say() {
-  const t = $("text").value.trim(); if (!t || !inCall) return;
+  const t = $("text").value.trim(); if (!t || $("send").disabled) return;
   ws.send(JSON.stringify({ type: "heard", text: t })); $("text").value = "";
 }
 $("send").onclick = say;

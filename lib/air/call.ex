@@ -6,11 +6,21 @@ defmodule Air.Call do
   Everything slow runs in Tasks (a model turn, a TTS stream, a gateway poll) whose results come back here, so
   the call always takes new events. One turn at a time: events that arrive meanwhile go into the next one.
   One speech item at a time, in order; the client plays them on one timeline.
+
+  **Ringing (user, 2026-11-27):** a dialled call rings (the client plays the ringback) while the greeting turn
+  runs and TTS warms up. It is answered once the greeting is synthesized whole, so the first words come the
+  moment the ringing stops (after `@pick_up_pause_ms`), and not before it has rung `@min_ring_ms`; if that takes longer than the ringback
+  lasts, nobody answers (`no_answer`), as on a phone. What the user says while it rings is not heard.
   """
   use GenServer, restart: :temporary
   require Logger
 
   alias Air.{Config, Gw, Operator}
+
+  # A ring, not a click, even when everything is warm.
+  @min_ring_ms 5_000
+  # From picking up to the first word: the music stops, a beat, then 「喂」 (user, 2026-11-27).
+  @pick_up_pause_ms 800
 
   def start(tenant, socket), do: DynamicSupervisor.start_child(Air.Sup, {__MODULE__, {tenant, socket}})
   def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
@@ -20,12 +30,14 @@ defmodule Air.Call do
   @impl true
   def init({t, socket}) do
     Process.monitor(socket)
-    clips = Config.clips(t["voice"])
+    # The memory as it is when the call starts.
+    system = Operator.system(t, Air.Memory.read(t["name"]))
 
     s = %{
-      t: t, socket: socket, clips: clips, messages: [], pending: [], turn: nil, speech: :queue.new(),
-      speaking: nil, tts: %{state: :off, up_s: 0}, following: MapSet.new(), polls: nil, warm: false, ending: false, n: 0, told: %{}, log: log_path(t),
-      ctx: %{t: t, clips: clips, call: self()}, phases: phases(t, clips)
+      t: t, socket: socket, messages: [], pending: [], turn: nil, speech: :queue.new(), speaking: nil,
+      tts: %{state: :off, up_s: 0}, following: MapSet.new(), polls: nil, ending: false, n: 0, told: %{},
+      log: log_path(t), ctx: %{t: t, call: self(), system: system, tools: Operator.tools()},
+      answered: false, rang_at: System.monotonic_time(:millisecond), greeting: [], greeting_task: nil
     }
 
     record(s, %{type: "call_start", tenant: t["name"], voice: t["voice"], temperature: t["temperature"],
@@ -35,7 +47,10 @@ defmodule Air.Call do
 
   @impl true
   def handle_continue(:dial, s) do
-    # Warm first and look once, so the greeting turn already knows TTS is cold.
+    ring = Config.ringback_ms()
+    out(s, %{type: "ringing", ms: ring})
+    Process.send_after(self(), :no_answer, ring)
+
     case Gw.warm() do
       :ok -> :ok
       {:error, e} -> out(s, %{type: "error", text: "warm: #{e}"})
@@ -49,10 +64,12 @@ defmodule Air.Call do
     record(s, %{type: "tts", state: s.tts.state, up_s: s.tts.up_s})
     state(s)
     Process.send_after(self(), :poll, 3_000)
-    {:noreply, s |> event("<call_started/>") |> sessions_list() |> flush()}
+    {:noreply, s |> event("<call_started/>") |> sessions_list() |> flush() |> pick_up()}
   end
 
   @impl true
+  def handle_info({:heard, _}, %{answered: false} = s), do: {:noreply, s}
+
   def handle_info({:heard, text}, s) do
     out(s, %{type: "heard", text: text})
     {:noreply, s |> event("<heard>#{text}</heard>") |> flush()}
@@ -62,6 +79,9 @@ defmodule Air.Call do
 
   # ── from the turn ──
 
+  # While it rings, what the greeting turn says is kept for pick_up/1.
+  def handle_info({:say, text}, %{answered: false} = s), do: {:noreply, %{s | greeting: s.greeting ++ [text]}}
+
   def handle_info({:say, text}, s) do
     if s.tts.state == :ready do
       out(s, %{type: "say", text: text, spoken: true})
@@ -70,12 +90,6 @@ defmodule Air.Call do
       out(s, %{type: "say", text: text, spoken: false})
       {:noreply, s}
     end
-  end
-
-  def handle_info({:clip, name}, s) do
-    text = Enum.find_value(s.clips, "", &(&1["name"] == name && &1["text"]))
-    out(s, %{type: "clip_log", name: name, text: text})
-    {:noreply, speak(s, {:clip, name})}
   end
 
   def handle_info(:end_call, s), do: {:noreply, speak(%{s | ending: true}, :end)}
@@ -103,6 +117,45 @@ defmodule Air.Call do
     {:noreply, s |> event(~s(<loom_error session="#{id}">#{msg}</loom_error>)) |> flush()}
   end
 
+  # ── ringing ──
+
+  def handle_info({:answer, pcm}, %{answered: false, ending: false} = s) do
+    out(s, %{type: "answered"})
+    Process.send_after(self(), {:greet, pcm}, @pick_up_pause_ms)
+    {:noreply, s}
+  end
+
+  def handle_info({:greet, pcm}, %{answered: false, ending: false} = s) do
+    for text <- s.greeting, do: out(s, %{type: "say", text: text, spoken: true})
+
+    s =
+      if pcm == "" do
+        s
+      else
+        id = s.n + 1
+        out(s, %{type: "speech", id: id, rate: Gw.sample_rate()})
+        for <<chunk::binary-size(9600) <- pcm>>, do: send(s.socket, {:pcm, chunk})
+        tail = rem(byte_size(pcm), 9600)
+        if tail > 0, do: send(s.socket, {:pcm, binary_part(pcm, byte_size(pcm) - tail, tail)})
+        send(s.socket, {:send, %{type: "speech_end", id: id}})
+        %{s | n: id}
+      end
+
+    {:noreply, %{s | answered: true, greeting: []} |> next_speech() |> flush()}
+  end
+
+  def handle_info({:answer, _}, s), do: {:noreply, s}
+  def handle_info({:greet, _}, s), do: {:noreply, s}
+
+  def handle_info(:no_answer, %{answered: false, ending: false} = s) do
+    out(s, %{type: "no_answer"})
+    # The client hangs up after the announcement; this is in case it doesn't.
+    Process.send_after(self(), :hangup, 30_000)
+    {:noreply, %{s | ending: true}}
+  end
+
+  def handle_info(:no_answer, s), do: {:noreply, s}
+
   # ── the gateway ──
 
   def handle_info(:poll, s) do
@@ -125,7 +178,21 @@ defmodule Air.Call do
           %{s | turn: nil}
       end
 
-    {:noreply, flush(s)}
+    {:noreply, s |> flush() |> pick_up()}
+  end
+
+  def handle_info({ref, result}, %{greeting_task: ref} = s) do
+    Process.demonitor(ref, [:flush])
+
+    pcm =
+      case result do
+        {:ok, pcm} -> pcm
+        {:error, e} -> out(s, %{type: "error", text: "tts: #{e}"}); ""
+      end
+
+    rung = System.monotonic_time(:millisecond) - s.rang_at
+    Process.send_after(self(), {:answer, pcm}, max(@min_ring_ms - rung, 0))
+    {:noreply, s}
   end
 
   def handle_info({ref, result}, %{speaking: ref} = s) do
@@ -148,12 +215,18 @@ defmodule Air.Call do
 
     state(s)
     Process.send_after(self(), :poll, if(s.tts.state == :ready, do: 15_000, else: 3_000))
-    {:noreply, %{s | polls: nil}}
+    {:noreply, pick_up(%{s | polls: nil})}
   end
 
   def handle_info({:DOWN, ref, _, _, why}, %{turn: ref} = s) do
     out(s, %{type: "error", text: "operator crashed: #{inspect(why)}"})
-    {:noreply, flush(%{s | turn: nil})}
+    {:noreply, %{s | turn: nil} |> flush() |> pick_up()}
+  end
+
+  def handle_info({:DOWN, ref, _, _, why}, %{greeting_task: ref} = s) do
+    out(s, %{type: "error", text: "tts crashed: #{inspect(why)}"})
+    send(self(), {:answer, ""})
+    {:noreply, s}
   end
 
   def handle_info({:DOWN, ref, _, _, why}, %{speaking: ref} = s) do
@@ -176,24 +249,33 @@ defmodule Air.Call do
   defp flush(%{turn: nil, pending: [_ | _], ending: false} = s) do
     {changed, s} = sessions_changed(s)
     text = Enum.join([state_tag(s) | changed] ++ s.pending, "\n")
-    phase = if s.tts.state == :ready, do: :warm, else: :cold
-    record(s, %{type: "turn_in", phase: phase, text: text})
-    # On the first warm turn the history becomes what the user heard (see Operator.spoken/1); left as it was,
-    # the model kept calling play_clip after the tool was gone, and spoke like its unheard cold-phase notes.
-    {messages, s} = if(phase == :warm and not s.warm, do: {Operator.spoken(s.messages), %{s | warm: true}}, else: {s.messages, s})
-    messages = append_user(messages, %{text: text})
-    ctx = Map.merge(s.ctx, s.phases[phase])
+    record(s, %{type: "turn_in", text: text})
+    messages = append_user(s.messages, %{text: text})
+    ctx = s.ctx
     task = Task.Supervisor.async_nolink(Air.Tasks, fn -> Operator.turn(ctx, messages) end)
     %{s | turn: task.ref, pending: []}
   end
 
   defp flush(s), do: s
 
-  # The prompt and tools per phase, from the memory as it is when the call starts. A turn takes the phase TTS
-  # is in when it starts: cold until it is ready, then warm for the rest of the call.
-  defp phases(t, clips) do
-    memory = Air.Memory.read(t["name"])
-    Map.new([:cold, :warm], &{&1, %{system: Operator.system(t, memory, &1), tools: Operator.tools(clips, &1)}})
+  # Picks up once the greeting turn is done and TTS is ready: the greeting is synthesized whole while it still
+  # rings, then answered (`{:answer, pcm}`), no sooner than @min_ring_ms after dialling.
+  defp pick_up(%{answered: false, ending: false, turn: nil, pending: [], greeting_task: nil, tts: %{state: :ready}} = s) do
+    text = Enum.join(s.greeting)
+    t = s.t
+    task = Task.Supervisor.async_nolink(Air.Tasks, fn -> if text == "", do: {:ok, ""}, else: synthesize(text, t) end)
+    %{s | greeting_task: task.ref}
+  end
+
+  defp pick_up(s), do: s
+
+  defp synthesize(text, t) do
+    key = make_ref()
+    Process.put(key, [])
+
+    with :ok <- Gw.speak(text, t["voice"], t["temperature"] || 0.85, &Process.put(key, [&1 | Process.get(key)])) do
+      {:ok, key |> Process.get() |> Enum.reverse() |> IO.iodata_to_binary()}
+    end
   end
 
   # Converse wants roles to alternate; a turn that ran out of tool rounds ends on a user message.
@@ -261,30 +343,17 @@ defmodule Air.Call do
   defp ago(ms) when ms < 86_400_000, do: "#{div(ms, 3_600_000)} h ago"
   defp ago(ms), do: "#{div(ms, 86_400_000)} d ago"
 
-  defp state_tag(s) do
-    tts =
-      case s.tts do
-        %{state: :ready} -> "ready"
-        %{state: :warming, up_s: up} -> "warming, up #{up}s"
-        %{state: st} -> to_string(st)
-      end
-
-    tasks = Enum.join(running(s), "; ")
-    ~s(<state tts="#{tts}" loom_tasks_running="#{tasks}"/>)
-  end
+  defp state_tag(s), do: ~s(<state loom_tasks_running="#{Enum.join(running(s), "; ")}"/>)
 
   # ── speech ──
 
   defp speak(s, item), do: next_speech(%{s | speech: :queue.in(item, s.speech)})
 
-  defp next_speech(%{speaking: nil} = s) do
+  # Nothing is spoken before the call is answered; the greeting goes first (handle_info {:answer, pcm}).
+  defp next_speech(%{speaking: nil, answered: true} = s) do
     case :queue.out(s.speech) do
       {:empty, _} ->
         s
-
-      {{:value, {:clip, name}}, q} ->
-        out(s, %{type: "clip", name: name})
-        next_speech(%{s | speech: q})
 
       {{:value, :end}, q} ->
         out(s, %{type: "end"})
@@ -316,7 +385,7 @@ defmodule Air.Call do
 
   # Cues and state ticks are not worth keeping; TTS changes are recorded where they happen.
   defp out(s, %{type: type} = msg) do
-    if type not in ~w(state speech speech_end clip), do: record(s, msg)
+    if type not in ~w(state speech speech_end), do: record(s, msg)
     send(s.socket, {:send, msg})
   end
 

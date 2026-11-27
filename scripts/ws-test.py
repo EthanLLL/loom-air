@@ -14,7 +14,7 @@ T0 = time.time()
 async def main():
     async with websockets.connect(URL, additional_headers={"Cookie": f"app_session={body}.{mac}"}, max_size=None) as ws:
         pcm, sid = bytearray(), None
-        async def drain(quiet):
+        async def drain(quiet, until=None):
             nonlocal pcm, sid
             while True:
                 try: m = await asyncio.wait_for(ws.recv(), quiet)
@@ -25,10 +25,11 @@ async def main():
                 if d["type"] == "speech_end":
                     w = wave.open(f"/tmp/air-test/speech-{d['id']}.wav", "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000); w.writeframes(bytes(pcm)); w.close()
                     d["audio_s"] = round(len(pcm) / 48000, 2)
-                if d["type"] == "hello": d["clips"] = len(d["clips"])
                 print(f"{time.time()-T0:6.1f}", json.dumps(d, ensure_ascii=False)[:600], flush=True)
-                if d["type"] == "ended": return
+                if d["type"] == "ended" or d["type"] == until: return
         await ws.send(json.dumps({"type": "dial"}))
+        # It rings until the greeting is ready (or nobody answers): wait for that, then for quiet.
+        await drain(120, "answered")
         await drain(QUIET)
         for line in sys.argv[1:]:
             if line.startswith("wait:"): await drain(float(line[5:])); continue

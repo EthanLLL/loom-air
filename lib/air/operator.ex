@@ -1,18 +1,17 @@
 defmodule Air.Operator do
   @moduledoc """
   The operator's prompt, tools and one turn. A turn runs in a Task owned by `Air.Call`: it calls the model,
-  sends every piece of output to the call as it appears (`{:say, text}`, `{:clip, name}`, `:end_call`,
+  sends every piece of output to the call as it appears (`{:say, text}`, `:end_call`,
   `{:task, …}`, `{:log, …}`) and loops while the model asks for tools. It returns the new messages.
   """
   @max_rounds 6
-  @final ~w(play_clip end_call send_to_session new_session)
+  @final ~w(end_call send_to_session new_session)
 
   @doc """
-  The system prompt for a phase: `:cold` while TTS is starting (only clips can be heard), `:warm` once it is
-  ready. A call switches once, cold to warm, at the start of a turn; the tool list changes with it, so the
-  cache is lost for that one round either way, and each phase gets the prompt that fits it.
+  The system prompt. Everything the operator writes is spoken: the call is answered only once TTS is ready
+  and the greeting is synthesized (`Air.Call`), so there is no phase in which it can't be heard.
   """
-  def system(t, memory, phase) do
+  def system(t, memory) do
     keywords = Enum.join(t["keywords"] || [], "、")
 
     """
@@ -26,7 +25,13 @@ defmodule Air.Operator do
     Your voice, in this persona:
     #{t["persona"]}
 
-    #{String.trim(speaking(phase))}
+    Everything you write as text is spoken aloud at once by TTS. How to speak:
+    - Simplified Chinese, spoken, one or two short sentences. No markdown, lists, emoji, code, URLs, session ids \
+    or file paths. Say numbers the way people say them.
+    - Never read out a long answer. A Loom reply is the written answer and stays in its session; give the gist \
+    in a sentence or two and say the details are in the session.
+    - Text after a tool result is spoken too, so never narrate what you did ("submitted", "checked"): after a \
+    tool, write only what you would say to them, or nothing.
 
     What to do:
     - When they ask for Loom or a session by name, do exactly that, even if you could answer yourself.
@@ -34,7 +39,8 @@ defmodule Air.Operator do
     - Anything that needs real work (their files, machines, code, data, the web, anything you would have to \
     guess): hand it to Loom. Use send_to_session when it clearly continues an existing session, otherwise \
     new_session. Write the prompt for an agent: full sentences in Chinese, self-contained, with what they asked \
-    and any detail they gave. #{handoff(phase)} The reply comes later as <loom_reply>; then tell them the gist.
+    and any detail they gave. In the same reply, before the tool call, tell them briefly that you're handing it \
+    over: nothing is said after it. The reply comes later as <loom_reply>; then tell them the gist.
     - Their sessions are listed in <sessions> when the call starts; <sessions_changed> brings what changed since. \
     Answer questions about which sessions exist or run from that, without a tool.
     - Asked about progress: read_sessions (all the sessions asked about in one call), never invent what a \
@@ -42,7 +48,9 @@ defmodule Air.Operator do
     - The sessions you read, send to or start are followed for the rest of the call: each time one finishes \
     a turn, its reply arrives as <loom_reply>, also for turns you did not start.
 
-    #{ends(phase)}
+    <call_started/>: they just dialled and the phone is ringing; greet them, short: it is the first thing \
+    they hear when you pick up.
+    When they say goodbye: say goodbye, then end_call.
 
     What you remember about them from earlier calls (use it naturally, never recite it):
     <memory>
@@ -51,36 +59,8 @@ defmodule Air.Operator do
     """
   end
 
-  defp speaking(:cold) do
-    """
-    Your speech synthesis is still starting up (about a minute), so nothing you write as text is heard. Speak \
-    only with play_clip: pick the kind that fits. Everything else works as usual.
-    """
-  end
-
-  defp speaking(:warm) do
-    """
-    Everything you write as text is spoken aloud at once by TTS. How to speak:
-    - Simplified Chinese, spoken, one or two short sentences. No markdown, lists, emoji, code, URLs, session ids \
-    or file paths. Say numbers the way people say them.
-    - Never read out a long answer. A Loom reply is the written answer and stays in its session; give the gist \
-    in a sentence or two and say the details are in the session.
-    - Text after a tool result is spoken too, so never narrate what you did ("submitted", "checked"): after a \
-    tool, write only what you would say to them, or nothing.
-    """
-  end
-
-  defp handoff(:cold), do: "In the same reply, play a handoff clip."
-  defp handoff(:warm), do: "In the same reply, before the tool call, tell them briefly that you're handing it over: nothing is said after it."
-
-  defp ends(:cold), do: "<call_started/>: they just dialled; greet them with a greet clip.\nWhen they say goodbye: a bye clip, then end_call."
-  defp ends(:warm), do: "<call_started/>: they just dialled; greet them.\nWhen they say goodbye: say goodbye, then end_call."
-
-  @doc "The tools for a phase: play_clip only while cold."
-  def tools(clips, :cold), do: [play_clip(clips) | tools()]
-  def tools(_clips, :warm), do: tools()
-
-  defp tools do
+  @doc "The operator's tools."
+  def tools do
     [
       tool("read_sessions", "Sessions' status and latest messages: the last few for one session, the last reply in short for several. Reading a session also follows it for the rest of the call.",
         %{session_ids: %{type: "array", items: %{type: "string"}}}, ["session_ids"]),
@@ -91,48 +71,6 @@ defmodule Air.Operator do
       tool("end_call", "Hang up. Only after saying goodbye.", %{}, [])
     ]
   end
-
-  # One kind per name prefix (greet_1, greet_2 → greet); the tool picks one of the kind at random and says
-  # which words were played. Adding a clip is adding a file: the kinds and examples come from the clips.
-  defp play_clip(clips) do
-    kinds = clips |> Enum.group_by(&kind/1) |> Enum.sort_by(fn {k, _} -> Enum.find_index(clips, &(kind(&1) == k)) end)
-    examples = Enum.map_join(kinds, "; ", fn {k, [c | _]} -> "#{k} (e.g. 「#{c["text"]}」)" end)
-
-    tool("play_clip", "Play a pre-recorded clip of your voice, picked at random from the kind. Kinds: #{examples}.",
-      %{kind: %{type: "string", enum: Enum.map(kinds, &elem(&1, 0))}}, ["kind"])
-  end
-
-  @doc """
-  A cold history as the user heard it, for the first warm turn: every play_clip call becomes the words it
-  played, as the operator's own text, and its result goes; failed calls go, and so does the text the operator
-  wrote, which nobody heard. Messages left empty go, and neighbours of one role merge.
-  """
-  def spoken(messages) do
-    played =
-      for %{role: "user", content: c} <- messages, %{toolResult: %{toolUseId: id} = r} <- c, into: %{} do
-        {id, with(%{content: [%{json: %{result: "played 「" <> rest}}]} <- r, do: String.trim_trailing(rest, "」"), else: (_ -> nil))}
-      end
-
-    clips = for %{role: "assistant", content: c} <- messages, %{toolUse: %{name: "play_clip", toolUseId: id}} <- c, into: MapSet.new(), do: id
-
-    messages
-    |> Enum.map(fn m ->
-      content =
-        Enum.flat_map(m.content, fn
-          %{toolUse: %{toolUseId: id}} = b -> if id in clips, do: (if t = played[id], do: [%{text: t}], else: []), else: [b]
-          %{toolResult: %{toolUseId: id}} = b -> if id in clips, do: [], else: [b]
-          %{text: _} when m.role == "assistant" -> []
-          b -> [b]
-        end)
-
-      %{m | content: content}
-    end)
-    |> Enum.reject(&(&1.content == []))
-    |> Enum.chunk_by(& &1.role)
-    |> Enum.map(fn [m | _] = ms -> %{m | content: Enum.flat_map(ms, & &1.content)} end)
-  end
-
-  def kind(%{"name" => name}), do: String.replace(name, ~r/_\d+$/, "")
 
   defp tool(name, desc, props, required) do
     %{toolSpec: %{name: name, description: desc, strict: true,
@@ -161,8 +99,8 @@ defmodule Air.Operator do
 
     case Air.Bedrock.converse(body, "operator") do
       {:ok, %{"output" => %{"message" => %{"content" => content}}, "stopReason" => stop}} ->
-        # Thinking blocks never go into the history: each is bound to the exact prompt and tools it was made
-        # under, and both change when the call warms up. They are never spoken either.
+        # Thinking blocks never go into the history (each is bound to the exact prompt and tools it was made
+        # under), and are never spoken.
         content = content |> Enum.map(&clean/1) |> Enum.reject(&is_nil/1)
         messages = messages ++ [%{role: "assistant", content: content}]
 
@@ -180,7 +118,7 @@ defmodule Air.Operator do
 
         cond do
           # These tools need no follow-up from the model: what to say was said before them, and asking
-          # anyway costs a round and made it narrate ("Greeting played."). A failure goes back to it, so it
+          # anyway costs a round and made it narrate ("Submitted."). A failure goes back to it, so it
           # can tell the user. The results stay in the history, merged with the next events.
           results != [] and not failed and Enum.all?(names, &(&1 in @final)) ->
             {:ok, messages ++ [%{role: "user", content: results}]}
@@ -207,13 +145,9 @@ defmodule Air.Operator do
   defp clean(other), do: other
 
   defp run(ctx, %{toolUseId: id, name: name, input: input}) do
-    # The model may still call a tool it saw earlier in the call but no longer has (play_clip after warm-up,
-    # copying its own history), and Bedrock lets that through. Refuse it; the error sends it back for a round.
     result =
       try do
-        if Enum.any?(ctx.tools, &(&1.toolSpec.name == name)),
-          do: tool_call(ctx, name, input),
-          else: {:error, "#{name} is not available now: speech synthesis is ready, say it as text"}
+        tool_call(ctx, name, input)
       rescue
         e -> {:error, Exception.message(e)}
       end
@@ -229,18 +163,6 @@ defmodule Air.Operator do
   defp summary({:ok, d}) when is_binary(d), do: d
   defp summary({:ok, d}), do: Jason.encode!(d) |> String.slice(0, 400)
   defp summary({:error, e}), do: "error: " <> to_string(e)
-
-  defp tool_call(ctx, "play_clip", %{"kind" => kind}) do
-    case Enum.filter(ctx.clips, &(kind(&1) == kind)) do
-      [] ->
-        {:error, "no clip of kind #{kind}"}
-
-      some ->
-        clip = Enum.random(some)
-        send(ctx.call, {:clip, clip["name"]})
-        {:ok, "played 「#{clip["text"]}」"}
-    end
-  end
 
   defp tool_call(ctx, "end_call", _) do
     send(ctx.call, :end_call)
