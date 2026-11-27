@@ -24,7 +24,8 @@ defmodule Air.Call do
 
   def start(tenant, socket), do: DynamicSupervisor.start_child(Air.Sup, {__MODULE__, {tenant, socket}})
   def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
-  def heard(call, text), do: send(call, {:heard, text})
+  @doc "What the phone heard; `timing` is the client's measure of the turn (speech, ASR, wait), kept in the record."
+  def heard(call, text, timing \\ nil), do: send(call, {:heard, text, timing})
   def hangup(call), do: send(call, :hangup)
 
   @impl true
@@ -68,10 +69,10 @@ defmodule Air.Call do
   end
 
   @impl true
-  def handle_info({:heard, _}, %{answered: false} = s), do: {:noreply, s}
+  def handle_info({:heard, _, _}, %{answered: false} = s), do: {:noreply, s}
 
-  def handle_info({:heard, text}, s) do
-    out(s, %{type: "heard", text: text})
+  def handle_info({:heard, text, timing}, s) do
+    out(s, if(timing, do: %{type: "heard", text: text, timing: timing}, else: %{type: "heard", text: text}))
     {:noreply, s |> event("<heard>#{text}</heard>") |> flush()}
   end
 

@@ -1,6 +1,6 @@
 defmodule Air.Web.Socket do
   @moduledoc """
-  The client's socket (WebSock). Client → server JSON: `dial`, `heard {text}`, `hangup`, and `ping` (or a ping frame) to keep it open: idle for two minutes, it closes. Server → client: JSON
+  The client's socket (WebSock). Client → server JSON: `dial`, `heard {text, timing?}`, `hangup`, and `ping` (or a ping frame) to keep it open: idle for two minutes, it closes. Server → client: JSON
   log and state messages from `Air.Call`, and PCM as binary frames between `speech` and `speech_end`.
   """
   @behaviour WebSock
@@ -19,8 +19,9 @@ defmodule Air.Web.Socket do
         Process.monitor(pid)
         {:push, {:text, Jason.encode!(%{type: "dialled"})}, %{s | call: pid}}
 
-      {:ok, %{"type" => "heard", "text" => text}} when s.call != nil and is_binary(text) ->
-        Air.Call.heard(s.call, String.slice(text, 0, 2000))
+      {:ok, %{"type" => "heard", "text" => text} = m} when s.call != nil and is_binary(text) ->
+        timing = if is_map(m["timing"]), do: Map.take(m["timing"], ~w(speech_ms asr_ms wait_ms transcriber))
+        Air.Call.heard(s.call, String.slice(text, 0, 2000), timing)
         {:ok, s}
 
       {:ok, %{"type" => "hangup"}} when s.call != nil ->
