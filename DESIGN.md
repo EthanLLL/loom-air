@@ -70,15 +70,26 @@ message as toolResult blocks.
 **Two outputs:** the Loom session's reply stays the canonical written answer; the operator only speaks a short,
 persona-styled version of it and points the user to the session for details.
 
-**Tenant config** (`data/tenants.json`, 0600): Loom URL + token, voice, temperature, persona text, ASR keywords, 
-`operator_name`, the name a client shows for the call (in `hello`), and `public_url`, the address its users sign in
-to their Loom at.
+**Tenants (user, 2026-11-27): one file per Loom,** `data/tenants/<host>.json` (0600): Loom URL + token, voice,
+temperature, persona text, ASR keywords, and `operator_name`, the name a client shows for the call (in `hello` and
+`/me`). The file's name is the address the tenant's users sign in to their Loom at (`loom.example.com`, or `host:port`
+off the default port): a Loom has one owner, so a Loom is a tenant, and its calls and memory go under the same name.
+Adding a tenant is adding a file; files are read on every use, so no restart.
 
 **Who a client is (user, 2026-11-27):** the web page has the shared app login cookie and names its tenant. An app has
-its Loom's login token: `Authorization: Bearer <token>` and `?loom=<the address it signed in to>`. The address picks
-the tenant by `public_url`, and that tenant's Loom, at its own `loom_url`, is asked whether the token is one of its
-logins (`GET /api/layout`). One sign-in, to the Loom; a login revoked there is shut out here too. A token is only
-ever sent to a Loom in tenants.json, never to an address the client gives. Yeses are kept a minute (`Air.Auth`).
+its Loom's login token: `Authorization: Bearer <token>` and `?loom=<the address it signed in to>`. The address is the
+tenant's file name, and that tenant's Loom, at its own `loom_url`, is asked whether the token is one of its logins
+(`GET /api/layout`). One sign-in, to the Loom; a login revoked there is shut out here too. A token is only ever sent
+to a Loom in `tenants/`, never to an address the client gives. Yeses are kept a minute (`Air.Auth`). A tenant gets
+only its own voice's clips.
+
+**Two doors (user, 2026-11-27):** Air is a service of its own (`loom-air.service`, always up) with two listeners on
+127.0.0.1. `AIR_API_PORT` (5311) is `Air.Web.Api`, behind a Cloudflare tunnel hostname: `/me` (does this Loom have
+Air, and who answers), the ringback, the clips and `/ws`, Loom login only; anything else is 404. `PORT` (5310) is
+`Air.Web.Router`, the Loom app `loom-air`'s: the test page behind the cookie, and what it calls, same-origin. A
+proxy-"all" Loom app must have a server, socket-activated and stopped when idle, so the app's server is
+`scripts/forward.py`, a byte-for-byte forwarder from the app's port to 5310.
+
 The persona and keywords go into the system prompt; voices and clips are private data, never in the repo.
 
 ## Call records and memory (user, 2026-11-25)
@@ -106,7 +117,8 @@ Air.Application
 ├─ Registry Air.Registry           LoomSocket per tenant
 ├─ DynamicSupervisor Air.Sup       Air.Call, Air.LoomSocket, Air.Memory (per tenant)
 ├─ Task.Supervisor Air.Tasks       model turns, TTS streams, gw polls
-└─ Bandit (Air.Web.Router)         page, ringback, clips, /ws (WebSock → Air.Web.Socket)
+├─ Bandit (Air.Web.Router, PORT)   the Loom app's door: page, ringback, clips, /ws (WebSock → Air.Web.Socket)
+└─ Bandit (Air.Web.Api, API_PORT)  the tunnel's door: /me, ringback, clips, /ws; Loom login only
 ```
 
 - **Air.Call** (GenServer, one per call, monitors its socket): `tenant`, `messages`, `pending` events, `turn`
@@ -130,10 +142,10 @@ Air.Application
 
 ## Web UI (v1 test client)
 
-A Loom app (`loom-air`, proxy all), behind the shared app login cookie. Dial / hang up, the gateway's state,
+A Loom app (`loom-air`, proxy all, through its forwarder), behind the shared app login cookie. Dial / hang up, the gateway's state,
 a text box standing in for the phone's ASR, and the call log: what was heard, what was said (spoken or not),
-tool calls, Loom replies. The text box opens once the call is answered. Audio plays through WebAudio. Later Loom Air moves to its own host and the
-iOS app replaces this page.
+tool calls, Loom replies. The text box opens once the call is answered. Audio plays through WebAudio. The iOS app calls
+through the tunnel's door.
 
 ## Not in v1
 

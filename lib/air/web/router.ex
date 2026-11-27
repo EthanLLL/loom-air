@@ -1,10 +1,11 @@
 defmodule Air.Web.Router do
   @moduledoc """
-  The test client: the page, the ringback, the voice's clips and `/ws`. Served as the Loom app `loom-air` (proxy all), so paths may
-  carry the `/apps/loom-air` prefix. The page is behind the shared app login cookie (`~/app-kit/auth.ts`'s
-  `app_session`); the ringback, the clips and `/ws` also take an app's Loom login (`Air.Auth`).
+  The door through the Loom app `loom-air` (proxy all), so paths may carry the `/apps/loom-air` prefix: the
+  test page, behind the shared app login cookie (`~/app-kit/auth.ts`'s `app_session`), and what it calls (the
+  ringback, the clips, `/ws`), which also take an app's Loom login. Apps come in by `Air.Web.Api` instead.
   """
   use Plug.Router
+  alias Air.Web.Serve
 
   plug :strip_prefix
   plug :match
@@ -26,27 +27,15 @@ defmodule Air.Web.Router do
   end
 
   get "/ringback.wav" do
-    with {:ok, _t, conn} <- client(conn) do
-      conn |> put_resp_content_type("audio/wav") |> send_file(200, Air.Config.ringback_path())
-    end
+    with {:ok, _t, conn} <- client(conn), do: Serve.ringback(conn)
   end
 
   get "/clips/:voice/:file" do
-    with {:ok, _t, conn} <- client(conn),
-         true <- Regex.match?(~r/^[\w-]+$/, voice) and Regex.match?(~r/^[\w-]+\.wav$/, file),
-         path = Air.Config.clip_path(voice, Path.rootname(file)),
-         true <- File.exists?(path) do
-      conn |> put_resp_content_type("audio/wav") |> send_file(200, path)
-    else
-      %Plug.Conn{} = c -> c
-      _ -> send_resp(conn, 404, "not found")
-    end
+    with {:ok, t, conn} <- client(conn), do: Serve.clip(conn, t, voice, file)
   end
 
   get "/ws" do
-    with {:ok, t, conn} <- client(conn) do
-      conn |> WebSockAdapter.upgrade(Air.Web.Socket, t, timeout: 120_000) |> halt()
-    end
+    with {:ok, t, conn} <- client(conn), do: Serve.ws(conn, t)
   end
 
   get "/:file" when file in @public do
@@ -64,11 +53,8 @@ defmodule Air.Web.Router do
     conn = fetch_query_params(conn)
 
     case get_req_header(conn, "authorization") do
-      ["Bearer " <> token] ->
-        case Air.Auth.app(conn.query_params["loom"], token) do
-          {:ok, t} -> {:ok, t, conn}
-          :error -> conn |> send_resp(401, "unauthorized") |> halt()
-        end
+      ["Bearer " <> _] ->
+        Serve.app(conn)
 
       _ ->
         with :ok <- authed(conn) do

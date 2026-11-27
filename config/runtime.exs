@@ -5,6 +5,7 @@ need = fn key -> System.get_env(key) || raise "#{key} is not set (see .env.examp
 
 config :air,
   port: String.to_integer(System.get_env("PORT", "5310")),
+  api_port: String.to_integer(System.get_env("AIR_API_PORT", "5311")),
   data: need.("AIR_DATA"),
   region: System.get_env("AIR_REGION", "us-west-2"),
   model: System.get_env("AIR_MODEL", "us.anthropic.claude-sonnet-5-5"),

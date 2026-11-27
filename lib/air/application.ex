@@ -12,7 +12,9 @@ defmodule Air.Application do
       {Registry, keys: :unique, name: Air.Registry},
       {DynamicSupervisor, name: Air.Sup, strategy: :one_for_one},
       {Task.Supervisor, name: Air.Tasks},
-      {Bandit, plug: Air.Web.Router, ip: {127, 0, 0, 1}, port: Application.fetch_env!(:air, :port)}
+      {Bandit, plug: Air.Web.Router, ip: {127, 0, 0, 1}, port: Application.fetch_env!(:air, :port)},
+      # The tunnel's: apps only (Air.Web.Api).
+      Supervisor.child_spec({Bandit, plug: Air.Web.Api, ip: {127, 0, 0, 1}, port: Application.fetch_env!(:air, :api_port)}, id: :api)
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Air.Supervisor)

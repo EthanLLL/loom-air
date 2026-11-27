@@ -2,7 +2,10 @@ defmodule Air.Config do
   @moduledoc """
   Files under the data directory, read on every use (they are tiny), so an edit needs no restart.
 
-    tenants.json   name → %{loom_url, loom_token, voice, temperature, persona, keywords, user, operator_name, public_url}
+    tenants/<host>.json   one per Loom (0600): %{loom_url, loom_token, voice, temperature, persona, keywords,
+                          user, operator_name}. The file's name is the address its users sign in to their Loom
+                          at (`loom.example.com`, or `host:port` off the default port), and the tenant's id:
+                          its calls and memory go under that name too.
     ringback.wav   what the phone plays while it rings (24 kHz s16le mono); its length is the ring timeout
     clips/<voice>/no_answer.wav   the "nobody answers" announcement, in the voice
     usage.jsonl    one line per model call
@@ -10,16 +13,27 @@ defmodule Air.Config do
   def data, do: Application.fetch_env!(:air, :data)
   def get(key), do: Application.fetch_env!(:air, key)
 
-  def tenants, do: data() |> Path.join("tenants.json") |> File.read!() |> Jason.decode!()
+  @doc "The tenants' ids."
+  def tenants do
+    case File.ls(Path.join(data(), "tenants")) do
+      {:ok, files} -> for f <- Enum.sort(files), String.ends_with?(f, ".json"), do: String.trim_trailing(f, ".json")
+      _ -> []
+    end
+  end
 
-  def tenant(name) do
-    case tenants() do
-      %{^name => t} -> {:ok, Map.put(t, "name", name)}
+  @doc "`{:ok, tenant}` (with its id as `\"name\"`) or `:error`."
+  def tenant(id) when is_binary(id) do
+    with true <- Regex.match?(~r/^[a-z0-9][a-z0-9.-]*(:\d+)?$/, id),
+         {:ok, s} <- File.read(Path.join([data(), "tenants", id <> ".json"])) do
+      {:ok, s |> Jason.decode!() |> Map.put("name", id)}
+    else
       _ -> :error
     end
   end
 
-  def default_tenant, do: tenants() |> Map.keys() |> Enum.sort() |> hd()
+  def tenant(_), do: :error
+
+  def default_tenant, do: List.first(tenants())
 
   def ringback_path, do: Path.join(data(), "ringback.wav")
 
