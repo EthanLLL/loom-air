@@ -1,6 +1,6 @@
 defmodule Air.Web.Socket do
   @moduledoc """
-  The client's socket (WebSock). Client → server JSON: `dial`, `heard {text}`, `hangup`. Server → client: JSON
+  The client's socket (WebSock). Client → server JSON: `dial`, `heard {text}`, `hangup`, and `ping` (or a ping frame) to keep it open: idle for two minutes, it closes. Server → client: JSON
   log and state messages from `Air.Call`, and PCM as binary frames between `speech` and `speech_end`.
   """
   @behaviour WebSock

@@ -90,7 +90,9 @@ function connect() {
   const url = new URL("ws", location.href); url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   ws = new WebSocket(url); ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => typeof e.data === "string" ? onMsg(JSON.parse(e.data)) : onPcm(e.data);
-  ws.onclose = () => { setCall(false); $("gpu").textContent = "断开，重连中"; $("dot").className = "dot"; setTimeout(connect, 2000); };
+  // Air closes a socket it has heard nothing on for two minutes; a call may be all listening.
+  const keep = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: "ping" })), 30000);
+  ws.onclose = () => { clearInterval(keep); setCall(false); $("gpu").textContent = "断开，重连中"; $("dot").className = "dot"; setTimeout(connect, 2000); };
 }
 
 async function load(path) {
