@@ -70,7 +70,15 @@ message as toolResult blocks.
 **Two outputs:** the Loom session's reply stays the canonical written answer; the operator only speaks a short,
 persona-styled version of it and points the user to the session for details.
 
-**Tenant config** (`data/tenants.json`, 0600): Loom URL + token, voice, temperature, persona text, ASR keywords.
+**Tenant config** (`data/tenants.json`, 0600): Loom URL + token, voice, temperature, persona text, ASR keywords, 
+`operator_name`, the name a client shows for the call (in `hello`), and `public_url`, the address its users sign in
+to their Loom at.
+
+**Who a client is (user, 2026-11-27):** the web page has the shared app login cookie and names its tenant. An app has
+its Loom's login token: `Authorization: Bearer <token>` and `?loom=<the address it signed in to>`. The address picks
+the tenant by `public_url`, and that tenant's Loom, at its own `loom_url`, is asked whether the token is one of its
+logins (`GET /api/layout`). One sign-in, to the Loom; a login revoked there is shut out here too. A token is only
+ever sent to a Loom in tenants.json, never to an address the client gives. Yeses are kept a minute (`Air.Auth`).
 The persona and keywords go into the system prompt; voices and clips are private data, never in the repo.
 
 ## Call records and memory (user, 2026-11-25)

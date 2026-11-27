@@ -113,7 +113,7 @@ function onMsg(m) {
   switch (m.type) {
     case "hello":
       voice = m.voice;
-      $("who").textContent = `${m.user ?? m.tenant} · ${m.voice}`;
+      $("who").textContent = `${m.operator ?? "Loom Air"} · ${m.voice}`;
       break;
     case "dialled": setCall(true); break;
     case "ringing": startRing(); add("sys", "正在呼叫…"); break;

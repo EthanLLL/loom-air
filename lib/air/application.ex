@@ -3,6 +3,8 @@ defmodule Air.Application do
 
   @impl true
   def start(_type, _args) do
+    Air.Auth.init()
+
     children = [
       # The NAT drops a connection idle for 350 s without telling us; a reused dead one hangs until the
       # receive timeout. Close idle ones well before that.

@@ -1,7 +1,8 @@
 defmodule Air.Web.Router do
   @moduledoc """
   The test client: the page, the ringback, the voice's clips and `/ws`. Served as the Loom app `loom-air` (proxy all), so paths may
-  carry the `/apps/loom-air` prefix. Behind the shared app login cookie (`~/app-kit/auth.ts`'s `app_session`).
+  carry the `/apps/loom-air` prefix. The page is behind the shared app login cookie (`~/app-kit/auth.ts`'s
+  `app_session`); the ringback, the clips and `/ws` also take an app's Loom login (`Air.Auth`).
   """
   use Plug.Router
 
@@ -25,13 +26,13 @@ defmodule Air.Web.Router do
   end
 
   get "/ringback.wav" do
-    with :ok <- authed(conn) do
+    with {:ok, _t, conn} <- client(conn) do
       conn |> put_resp_content_type("audio/wav") |> send_file(200, Air.Config.ringback_path())
     end
   end
 
   get "/clips/:voice/:file" do
-    with :ok <- authed(conn),
+    with {:ok, _t, conn} <- client(conn),
          true <- Regex.match?(~r/^[\w-]+$/, voice) and Regex.match?(~r/^[\w-]+\.wav$/, file),
          path = Air.Config.clip_path(voice, Path.rootname(file)),
          true <- File.exists?(path) do
@@ -43,14 +44,8 @@ defmodule Air.Web.Router do
   end
 
   get "/ws" do
-    with :ok <- authed(conn) do
-      conn = fetch_query_params(conn)
-      name = conn.query_params["tenant"] || Air.Config.default_tenant()
-
-      case Air.Config.tenant(name) do
-        {:ok, t} -> conn |> WebSockAdapter.upgrade(Air.Web.Socket, t, timeout: 120_000) |> halt()
-        :error -> send_resp(conn, 404, "no tenant")
-      end
+    with {:ok, t, conn} <- client(conn) do
+      conn |> WebSockAdapter.upgrade(Air.Web.Socket, t, timeout: 120_000) |> halt()
     end
   end
 
@@ -63,6 +58,27 @@ defmodule Air.Web.Router do
   end
 
   defp static(file), do: Path.join(:code.priv_dir(:air), "static/" <> file)
+
+  # The tenant: an app's by its Loom login, or, with the app cookie, the one the page names (else the first).
+  defp client(conn) do
+    conn = fetch_query_params(conn)
+
+    case get_req_header(conn, "authorization") do
+      ["Bearer " <> token] ->
+        case Air.Auth.app(conn.query_params["loom"], token) do
+          {:ok, t} -> {:ok, t, conn}
+          :error -> conn |> send_resp(401, "unauthorized") |> halt()
+        end
+
+      _ ->
+        with :ok <- authed(conn) do
+          case Air.Config.tenant(conn.query_params["tenant"] || Air.Config.default_tenant()) do
+            {:ok, t} -> {:ok, t, conn}
+            :error -> conn |> send_resp(404, "no tenant") |> halt()
+          end
+        end
+    end
+  end
 
   defp authed(conn) do
     conn = fetch_cookies(conn)

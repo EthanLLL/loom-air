@@ -2,7 +2,7 @@ defmodule Air.Config do
   @moduledoc """
   Files under the data directory, read on every use (they are tiny), so an edit needs no restart.
 
-    tenants.json   name → %{loom_url, loom_token, voice, temperature, persona, keywords, user}
+    tenants.json   name → %{loom_url, loom_token, voice, temperature, persona, keywords, user, operator_name, public_url}
     ringback.wav   what the phone plays while it rings (24 kHz s16le mono); its length is the ring timeout
     clips/<voice>/no_answer.wav   the "nobody answers" announcement, in the voice
     usage.jsonl    one line per model call
