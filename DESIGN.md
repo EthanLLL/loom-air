@@ -32,6 +32,9 @@ It is answered once the greeting is synthesized whole, so the first words come 0
 as when someone picks up), and never before it has rung 5 s, so a warm call still rings. A cold start (~65 s) fits inside the ringback; if TTS
 takes longer than the ringback lasts (87.6 s), nobody answers: the client plays the voice saying
 「您拨打的电话暂时无人接听，请稍后再拨」 and hangs up. What the user says while it rings is not heard.
+Apps keep the ringback on disk for good (user, 2026-11-28): `/me` says its version (the start of its SHA-256, also
+the file's ETag), and an app downloads it again only when that changed; offline, or when Air can't say, it rings
+with what it has.
 
 So everything the operator writes is spoken, and it has one prompt and one tool list for the whole call. This
 replaced a cold phase (2026-11-25..27) in which the operator spoke through pre-recorded clips with a `play_clip`

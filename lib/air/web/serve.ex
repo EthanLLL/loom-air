@@ -18,7 +18,12 @@ defmodule Air.Web.Serve do
     end
   end
 
-  def ringback(conn), do: conn |> put_resp_content_type("audio/wav") |> send_file(200, Air.Config.ringback_path())
+  def ringback(conn) do
+    conn
+    |> put_resp_content_type("audio/wav")
+    |> put_resp_header("etag", ~s("#{Air.Config.ringback_version()}"))
+    |> send_file(200, Air.Config.ringback_path())
+  end
 
   # Only the tenant's own voice: one family's clips are not another's.
   def clip(conn, t, voice, file) do
@@ -31,9 +36,12 @@ defmodule Air.Web.Serve do
     end
   end
 
-  @doc "Whether this Loom has Air, and who answers: an app asks before it shows a call button."
+  @doc """
+  Whether this Loom has Air, and who answers: an app asks before it shows a call button. With the ringback's
+  version, so an app that keeps the ringback downloads it again only when it changed.
+  """
   def me(conn, t) do
-    body = Jason.encode!(%{operator: t["operator_name"], voice: t["voice"]})
+    body = Jason.encode!(%{operator: t["operator_name"], voice: t["voice"], ringback: Air.Config.ringback_version()})
     conn |> put_resp_content_type("application/json") |> send_resp(200, body)
   end
 

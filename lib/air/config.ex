@@ -37,6 +37,34 @@ defmodule Air.Config do
 
   def ringback_path, do: Path.join(data(), "ringback.wav")
 
+  @doc """
+  The ringback's version, which apps keep it on disk by (in `/me`, and the file's ETag): the start of its SHA-256,
+  hashed again only when the file's size or time changes. nil without a ringback.
+  """
+  def ringback_version do
+    path = ringback_path()
+
+    with {:ok, %{size: size, mtime: mtime}} <- File.stat(path, time: :posix) do
+      key = {__MODULE__, :ringback_version}
+
+      case :persistent_term.get(key, nil) do
+        {^size, ^mtime, version} ->
+          version
+
+        _ ->
+          hash =
+            File.stream!(path, 65_536)
+            |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
+
+          version = :crypto.hash_final(hash) |> Base.encode16(case: :lower) |> binary_part(0, 16)
+          :persistent_term.put(key, {size, mtime, version})
+          version
+      end
+    else
+      _ -> nil
+    end
+  end
+
   @doc "How long the ringback lasts, in ms: 24 kHz s16le mono after a 44-byte header."
   def ringback_ms do
     case File.stat(ringback_path()) do
